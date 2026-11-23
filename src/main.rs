@@ -43,6 +43,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 const PRE_ZSH: &str = include_str!("../shell/pre.zsh");
 const POST_ZSH: &str = include_str!("../shell/post.zsh");
+const ZSH_INIT_CACHE: &str = include_str!("../shell/zsh-init-cache.zsh");
 const PRE_FISH: &str = include_str!("../shell/pre.fish");
 const POST_FISH: &str = include_str!("../shell/post.fish");
 const PRE_BASH: &str = include_str!("../shell/pre.bash");
@@ -469,11 +470,14 @@ fn init_script(shell: ShellKind, part: Part) -> String {
     }
     let bin = match shell {
         ShellKind::Fish => fish_quote(&exe()),
+        ShellKind::Zsh => zsh_quote(&exe()),
+        ShellKind::Bash => sh_quote(&exe()),
+        ShellKind::Nu => nu_quote(&exe()),
         // Inside '…' in pre.ps1.
         ShellKind::Pwsh | ShellKind::Powershell => exe().replace('\'', "''"),
-        _ => exe(),
+        ShellKind::Cmd => exe(),
     };
-    s.replace("@LIG_BIN@", &bin)
+    if matches!(shell, ShellKind::Nu) { s.replace("@LIG_BIN_NU@", &bin) } else { s.replace("@LIG_BIN@", &bin) }
 }
 
 // Markers around the blocks `lig install` adds to the rc file.
@@ -510,6 +514,46 @@ fn fish_quote(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+fn zsh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn nu_quote(s: &str) -> String {
+    for count in 1.. {
+        let hashes = "#".repeat(count);
+        let closing = format!("'{hashes}");
+        if !s.contains(&closing) {
+            return format!("r{hashes}'{s}'{hashes}");
+        }
+    }
+    unreachable!()
+}
+
+fn zsh_init_command(part: &str, bin: &str, cache_dir: Option<&Path>) -> String {
+    let Some(cache_dir) = cache_dir else {
+        return format!("eval \"$({} init zsh {part})\"", zsh_quote(bin));
+    };
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bin.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let key = format!("{hash:016x}");
+    if part == "pre" {
+        ZSH_INIT_CACHE
+            .replace("@LIG_BIN_QUOTED@", &zsh_quote(bin))
+            .replace("@LIG_CACHE_DIR_QUOTED@", &zsh_quote(&cache_dir.to_string_lossy()))
+            .replace("@LIG_BIN_KEY@", &key)
+            + "\n_lig_load_init pre"
+    } else {
+        "_lig_load_init post".into()
+    }
+}
+
 /// `text` without its UTF-8 byte order mark, and the mark (Windows PowerShell's editors write one).
 fn split_bom(text: &str) -> (&str, &str) {
     text.strip_prefix('\u{feff}').map_or(("", text), |rest| ("\u{feff}", rest))
@@ -539,6 +583,7 @@ fn installed_text(shell: ShellKind, old: &str, bin: &str) -> Result<String> {
     let body = managed_body(old)?;
     let (bom, body) = split_bom(&body);
     let sh = shell.name();
+    let zsh_cache_dir = dirs::cache_dir().map(|dir| dir.join("lig/zsh"));
     if shell.powershell() {
         // Only the top: lig loads the rest itself.
         let line = format!("Invoke-Expression (& {} init {sh} pre | Out-String)", ps_quote(bin));
@@ -548,11 +593,13 @@ fn installed_text(shell: ShellKind, old: &str, bin: &str) -> Result<String> {
         if matches!(shell, ShellKind::Nu) {
             // nu can't eval a command's output: the integration itself goes in the file.
             let script = if part == "pre" { PRE_NU } else { POST_NU };
-            script.replace("@LIG_BIN@", bin).trim_end().to_string()
+            script.replace("@LIG_BIN_NU@", &nu_quote(bin)).trim_end().to_string()
         } else if matches!(shell, ShellKind::Fish) {
             format!("eval ({} init fish {part} | string collect)", fish_quote(bin))
+        } else if matches!(shell, ShellKind::Zsh) {
+            zsh_init_command(part, bin, zsh_cache_dir.as_deref())
         } else {
-            format!("eval \"$(\"{bin}\" init {sh} {part})\"")
+            format!("eval \"$({} init {sh} {part})\"", sh_quote(bin))
         }
     };
     Ok(format!(
@@ -1509,11 +1556,111 @@ mod shell_tests {
             PathBuf::from("/home/test/.config/fish/config.fish")
         );
         assert_eq!(fish_quote("a'b\\c"), "'a\\'b\\\\c'");
+        assert_eq!(zsh_quote("a'b c"), "'a'\\''b c'");
+        assert_eq!(sh_quote("a'b c"), "'a'\\''b c'");
+        assert_eq!(nu_quote("a' b"), "r#'a' b'#");
         for part in [Part::Pre, Part::Post, Part::All] {
             let script = init_script(ShellKind::Fish, part);
             assert!(!script.contains("@LIG_BIN@"));
             assert!(!script.contains("$("));
         }
+    }
+
+    #[test]
+    fn zsh_install_caches_generated_integration_and_is_valid_zsh() {
+        let body = "# user config\n";
+        let text = installed_text(ShellKind::Zsh, body, "/tmp/lig 'quoted'/lig").unwrap();
+        assert!(text.contains("_lig_load_init pre"));
+        assert!(text.contains("_lig_load_init post"));
+        assert!(text.contains("zstat -H binary_stat"));
+        assert!(text.contains("lig-init-end-v2"));
+        assert!(!text.contains("std::env::temp_dir"));
+        assert!(text.contains("command mv -f"));
+        assert!(text.contains("binary='/tmp/lig '\\''quoted'\\''/lig'"));
+        assert_eq!(managed_body(&text).unwrap(), body);
+        assert_eq!(installed_text(ShellKind::Zsh, &text, "/tmp/lig 'quoted'/lig").unwrap(), text);
+
+        if std::process::Command::new("zsh").arg("--version").output().is_err() {
+            return;
+        }
+        for script in [text, init_script(ShellKind::Zsh, Part::All)] {
+            let mut child = std::process::Command::new("zsh")
+                .args(["-f", "-n"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+            assert!(child.wait().unwrap().success(), "generated Zsh script must parse");
+        }
+    }
+
+    #[test]
+    fn zsh_init_cache_hits_and_refreshes_when_the_binary_changes() {
+        if std::process::Command::new("zsh").arg("--version").output().is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("lig-zsh-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let lig = root.join("lig $(touch marker) `quoted` 'binary'");
+        std::fs::write(
+            &lig,
+            "#!/bin/sh\nprintf '%s\\n' \"$3\" >> \"$HOME/calls\"\nprintf 'print -r -- \\\"from-%s\\\" >> \\\"$HOME/sources\\\"\\n' \"$3\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&lig, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = root.canonicalize().unwrap().join("cache/lig/zsh");
+        let rc = root.join(".zshrc");
+        let contents = format!(
+            "{}\n{}\n",
+            zsh_init_command("pre", &lig.to_string_lossy(), Some(&cache)),
+            zsh_init_command("post", &lig.to_string_lossy(), Some(&cache))
+        );
+        std::fs::write(&rc, contents).unwrap();
+        let run = || {
+            let output = std::process::Command::new("zsh")
+                .args(["-f", "-c", "source \"$ZDOTDIR/.zshrc\""])
+                .env("HOME", &root)
+                .env("ZDOTDIR", &root)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+        let cache_file = |part: &str| {
+            std::fs::read_dir(&cache)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| path.file_name().unwrap().to_string_lossy().ends_with(&format!("-{part}.zsh")))
+                .unwrap()
+        };
+
+        run();
+        assert!(!root.join("marker").exists(), "metacharacters in the binary path must stay quoted");
+        assert_eq!(read("calls"), "pre\npost\n");
+        assert_eq!(read("sources"), "from-pre\nfrom-post\n");
+        assert_eq!(std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777, 0o700);
+
+        run();
+        assert_eq!(read("calls"), "pre\npost\n", "valid caches avoid starting Lig");
+        assert_eq!(read("sources"), "from-pre\nfrom-post\nfrom-pre\nfrom-post\n");
+
+        let pre_cache = cache_file("pre");
+        let contents = std::fs::read_to_string(&pre_cache).unwrap();
+        std::fs::write(&pre_cache, contents.lines().next().unwrap()).unwrap();
+        run();
+        assert_eq!(read("calls"), "pre\npost\npre\n", "truncated cache is regenerated");
+
+        std::fs::OpenOptions::new().append(true).open(&lig).unwrap().write_all(b"# updated\n").unwrap();
+        run();
+        assert_eq!(read("calls"), "pre\npost\npre\npre\npost\n", "a new Lig binary refreshes both parts");
+
+        std::fs::set_permissions(cache_file("pre"), std::fs::Permissions::from_mode(0o666)).unwrap();
+        run();
+        assert_eq!(read("calls"), "pre\npost\npre\npre\npost\npre\n", "writable caches are regenerated");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
