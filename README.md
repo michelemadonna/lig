@@ -82,16 +82,19 @@ Optional: `curl` for package search, a [Nerd Font](https://www.nerdfonts.com) fo
 `lig install` adds a few lines to your shell's config file (`~/.zshrc`, `~/.bashrc`,
 `config.fish`, `config.nu` or the PowerShell profile), backing it up first; to add them
 yourself, see [Set up a shell by hand](#set-up-a-shell-by-hand).
-For Zsh, the managed setup writes the loader to `.lig-init.zsh` next to `.zshrc`
-(respecting `ZDOTDIR`). Only a `source` followed by `_lig_load_init pre` at the top and
-`_lig_load_init post` at the bottom are added to `.zshrc`. Running `lig install zsh` again
-updates the helper and replaces older inline loaders automatically. `lig uninstall zsh`
-also removes the generated helper; an unrelated file with that name is preserved.
+For Zsh, the managed setup writes `lig-init.zsh` and its compiled `lig-init.zsh.zwc`
+to `${XDG_CACHE_HOME:-$HOME/.cache}/lig`, creating the directory if needed (also on macOS).
+Zsh automatically uses the compiled helper when sourcing it. Only a `source` followed by
+`_lig_load_init pre` at the top and `_lig_load_init post` at the bottom are added to `.zshrc`
+(respecting `ZDOTDIR`). Running `lig install zsh` again updates and recompiles the helper,
+replaces older inline loaders, and removes the previous generated helper next to `.zshrc`.
+`lig uninstall zsh` removes the generated helper and its compiled file; unrelated files
+are preserved. After deleting the cache directory, run `lig install zsh` again to restore them.
 
-The loader caches the generated integration in the standard user cache directory and
-refreshes it when the Lig binary or Zsh version changes. If cache permissions are unsafe,
-it generates the integration directly. The helper persists independently of the cache.
-Hand-written `eval "$(lig init zsh …)"` blocks remain supported and generate it directly.
+Generated integration scripts are cached in the `zsh` subdirectory and refreshed when the
+Lig binary or Zsh version changes. If that cache cannot be used safely, the helper generates
+the integration directly. Hand-written `eval "$(lig init zsh …)"` blocks remain supported
+and generate it directly.
 Prebuilt archives, `.deb` and `.rpm` files are on the
 [releases page](https://github.com/KevenGoncalves/lig/releases/latest).
 
@@ -123,12 +126,12 @@ prompt, and connects the shell to the popup. Keep the marker comments: `lig doct
 `lig uninstall` look for them. `lig` must be on your `PATH` (or write its full path).
 
 For the managed Zsh cache setup, run `lig install zsh` to create the helper. With the
-usual home directory, the generated blocks look like this (the installer uses an absolute,
-quoted helper path):
+default cache directory, the generated blocks look like this (the installer resolves
+`XDG_CACHE_HOME` and uses an absolute, quoted helper path):
 
 ```zsh
 # >>> lig pre >>>
-builtin source '/home/you/.lig-init.zsh' && _lig_load_init pre
+builtin source '/home/you/.cache/lig/lig-init.zsh' && _lig_load_init pre
 # <<< lig pre <<<
 
 # ... the rest of your config ...

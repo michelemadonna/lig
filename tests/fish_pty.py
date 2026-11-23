@@ -32,6 +32,7 @@ class Fish:
         self.tmp = tempfile.TemporaryDirectory(prefix='lig-fish-test-')
         self.home = Path(self.tmp.name)
         self.env = dict(os.environ, HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / 'config'),
+                        XDG_CACHE_HOME=str(self.home / 'cache'),
                         XDG_DATA_HOME=str(self.home / 'data'), XDG_STATE_HOME=str(self.home / 'state'),
                         XDG_RUNTIME_DIR=str(self.home / 'runtime'),
                         PATH=str(BIN.parent) + os.pathsep + os.environ.get('PATH', ''),

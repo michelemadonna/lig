@@ -555,10 +555,97 @@ fn zsh_init_loader(bin: &str, cache_dir: Option<&Path>) -> String {
             .replace("@LIG_BIN_KEY@", &key)
 }
 
-fn zsh_helper_path(rc: &Path) -> Result<PathBuf> {
-    let parent = rc.parent().context("configuration has no parent")?;
-    let parent = if parent.is_absolute() { parent.to_path_buf() } else { std::env::current_dir()?.join(parent) };
-    Ok(parent.join(".lig-init.zsh"))
+fn resolve_zsh_cache_dir(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf> {
+    let base = match xdg.filter(|dir| !dir.as_os_str().is_empty()) {
+        Some(dir) => dir,
+        None => home.context("cannot locate HOME for the Zsh cache")?.join(".cache"),
+    };
+    let base = if base.is_absolute() { base } else { std::env::current_dir()?.join(base) };
+    Ok(base.join("lig"))
+}
+
+fn zsh_helper_path() -> Result<PathBuf> {
+    let cache = resolve_zsh_cache_dir(std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from), dirs::home_dir())?;
+    Ok(cache.join("lig-init.zsh"))
+}
+
+fn zsh_compiled_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".zwc");
+    name.into()
+}
+
+/// Only generated word code for this source may be replaced or removed.
+fn managed_zsh_compiled(path: &Path) -> Result<bool> {
+    let compiled = zsh_compiled_path(path);
+    let meta = match std::fs::symlink_metadata(&compiled) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    anyhow::ensure!(meta.is_file(), "{} is not a regular compiled helper", compiled.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(
+            meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0,
+            "{} has unsafe ownership or permissions",
+            compiled.display()
+        );
+    }
+    anyhow::ensure!(managed_zsh_helper(path)?, "{} has no managed source", compiled.display());
+    // Word code is derived from the managed source. Allow regeneration even
+    // when it is damaged or was produced by an older Zsh version.
+    Ok(true)
+}
+
+fn ensure_zsh_helper_dir(path: &Path) -> Result<()> {
+    // Check existing ancestors before creating the executable cache directory.
+    for dir in path.ancestors() {
+        let meta = match std::fs::symlink_metadata(dir) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        // macOS exposes system directories such as /var through root-owned
+        // links. Validate their resolved directory; reject user-planted links.
+        #[cfg(unix)]
+        let meta = {
+            use std::os::unix::fs::MetadataExt;
+            if meta.file_type().is_symlink() && meta.uid() == 0 { std::fs::metadata(dir)? } else { meta }
+        };
+        anyhow::ensure!(meta.is_dir(), "{} is not a real cache directory", dir.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let sticky_root = meta.uid() == 0 && meta.mode() & 0o1000 != 0;
+            anyhow::ensure!(
+                (meta.uid() == unsafe { libc::geteuid() } || meta.uid() == 0)
+                    && (meta.mode() & 0o022 == 0 || sticky_root),
+                "unsafe cache directory {}",
+                dir.display()
+            );
+        }
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0,
+            "unsafe cache directory {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Read only a regular helper owned by this user, never a symlink or a user file.
@@ -598,7 +685,10 @@ fn managed_zsh_helper(path: &Path) -> Result<bool> {
 }
 
 fn write_zsh_helper(path: &Path, contents: &str) -> Result<()> {
+    let parent = path.parent().context("helper has no parent")?;
+    ensure_zsh_helper_dir(parent)?;
     managed_zsh_helper(path)?;
+    let has_compiled = managed_zsh_compiled(path)?;
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
     let tmp = path.with_file_name(format!(".lig-init-{}-{nonce}.tmp", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
@@ -612,17 +702,54 @@ fn write_zsh_helper(path: &Path, contents: &str) -> Result<()> {
     let result = (|| -> Result<()> {
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
+        if has_compiled {
+            std::fs::remove_file(zsh_compiled_path(path))?;
+        }
         std::fs::rename(&tmp, path)?;
         Ok(())
     })();
     let _ = std::fs::remove_file(&tmp);
-    result
+    result?;
+    let compiled_tmp = zsh_compiled_path(&tmp);
+    let compile_result = (|| -> Result<()> {
+        let mut reserved = std::fs::OpenOptions::new();
+        reserved.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            reserved.mode(0o600);
+        }
+        drop(reserved.open(&compiled_tmp)?);
+        let output = std::process::Command::new("zsh")
+            .args(["-f", "-c", "umask 077; builtin zcompile -R -- \"$1\" \"$2\"", "lig-zcompile"])
+            .arg(&compiled_tmp)
+            .arg(path)
+            .output()
+            .context("compiling Zsh helper")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Zsh helper compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&compiled_tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::File::open(&compiled_tmp)?.sync_all()?;
+        std::fs::rename(&compiled_tmp, zsh_compiled_path(path))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(compiled_tmp);
+    compile_result
 }
 
-fn remove_zsh_helper(rc: &Path) -> Result<()> {
-    let path = zsh_helper_path(rc)?;
+fn remove_zsh_helper(path: &Path) -> Result<()> {
     // Preserve user files, links, and anything no longer identified as our helper.
-    if managed_zsh_helper(&path).unwrap_or(false) {
+    if managed_zsh_helper(path).unwrap_or(false) {
+        if managed_zsh_compiled(path).unwrap_or(false) {
+            std::fs::remove_file(zsh_compiled_path(path))?;
+        }
         std::fs::remove_file(path)?;
     }
     Ok(())
@@ -655,14 +782,15 @@ fn managed_body(old: &str) -> Result<String> {
 
 #[cfg(test)]
 fn installed_text(shell: ShellKind, old: &str, bin: &str) -> Result<String> {
-    installed_text_at(shell, old, bin, &shell.rc())
+    let helper = if shell == ShellKind::Zsh { zsh_helper_path()? } else { PathBuf::new() };
+    installed_text_at(shell, old, bin, &helper)
 }
 
-fn installed_text_at(shell: ShellKind, old: &str, bin: &str, rc: &Path) -> Result<String> {
+fn installed_text_at(shell: ShellKind, old: &str, bin: &str, helper: &Path) -> Result<String> {
     let body = managed_body(old)?;
     let (bom, body) = split_bom(&body);
     let sh = shell.name();
-    let helper = zsh_quote(&zsh_helper_path(rc)?.to_string_lossy());
+    let helper = zsh_quote(&helper.to_string_lossy());
     if shell.powershell() {
         // Only the top: lig loads the rest itself.
         let line = format!("Invoke-Expression (& {} init {sh} pre | Out-String)", ps_quote(bin));
@@ -695,22 +823,34 @@ fn installed_text_at(shell: ShellKind, old: &str, bin: &str, rc: &Path) -> Resul
 
 /// Backs up the original rc file once, as `<rc>.lig-backup`.
 fn install_at(shell: ShellKind, rc: &Path, bin: &str) -> Result<()> {
+    let helper = if shell == ShellKind::Zsh { zsh_helper_path()? } else { PathBuf::new() };
+    install_at_with_helper(shell, rc, bin, &helper)
+}
+
+fn install_at_with_helper(shell: ShellKind, rc: &Path, bin: &str, helper: &Path) -> Result<()> {
     let old = match std::fs::read_to_string(rc) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
-    let new = installed_text_at(shell, &old, bin, rc)?;
+    let new = installed_text_at(shell, &old, bin, helper)?;
     std::fs::create_dir_all(rc.parent().context("configuration has no parent")?)?;
     if shell == ShellKind::Zsh {
-        let cache = dirs::cache_dir().map(|dir| dir.join("lig/zsh"));
-        write_zsh_helper(&zsh_helper_path(rc)?, &zsh_init_loader(bin, cache.as_deref()))?;
+        let cache = helper.parent().context("helper has no parent")?.join("zsh");
+        write_zsh_helper(helper, &zsh_init_loader(bin, Some(&cache)))?;
     }
     let backup = rc.with_file_name(format!("{}.lig-backup", rc.file_name().unwrap().to_string_lossy()));
     if rc.exists() && !backup.exists() {
         std::fs::copy(rc, &backup)?;
     }
-    std::fs::write(rc, new).with_context(|| format!("writing {}", rc.display()))
+    std::fs::write(rc, new).with_context(|| format!("writing {}", rc.display()))?;
+    if shell == ShellKind::Zsh {
+        let legacy = rc.with_file_name(".lig-init.zsh");
+        if legacy != helper {
+            remove_zsh_helper(&legacy)?;
+        }
+    }
+    Ok(())
 }
 
 /// The file a login bash reads, in bash's order; `.bash_profile` when none exists.
@@ -804,7 +944,8 @@ fn uninstall(shell: ShellKind) -> Result<()> {
     }
     std::fs::write(&rc, new)?;
     if shell == ShellKind::Zsh {
-        remove_zsh_helper(&rc)?;
+        remove_zsh_helper(&zsh_helper_path()?)?;
+        remove_zsh_helper(&rc.with_file_name(".lig-init.zsh"))?;
     }
     println!("lig: removed from {}; new {} sessions start without it", rc.display(), shell.name());
     if cfg!(target_os = "macos") && matches!(shell, ShellKind::Bash) {
@@ -1664,7 +1805,7 @@ mod shell_tests {
         assert!(text.contains("_lig_load_init post"));
         assert!(!text.contains("_lig_load_init()"));
         assert!(text.contains("builtin source "));
-        assert!(text.contains(".lig-init.zsh' && _lig_load_init pre"));
+        assert!(text.contains("lig-init.zsh' && _lig_load_init pre"));
         let loader = zsh_init_loader("/tmp/lig 'quoted'/lig", Some(Path::new("/cache/lig/zsh")));
         assert!(loader.contains("zstat -H binary_stat"));
         assert!(loader.contains("binary='/tmp/lig '\\''quoted'\\''/lig'"));
@@ -1703,10 +1844,21 @@ mod shell_tests {
         let cache = root.canonicalize().unwrap().join("cache/lig/zsh");
         let rc = root.join(".zshrc");
         let old = "# user config\n";
-        let contents = installed_text_at(ShellKind::Zsh, old, &lig.to_string_lossy(), &rc).unwrap();
-        let helper = zsh_helper_path(&rc).unwrap();
+        let helper = cache.parent().unwrap().join("lig-init.zsh");
+        let contents = installed_text_at(ShellKind::Zsh, old, &lig.to_string_lossy(), &helper).unwrap();
         write_zsh_helper(&helper, &zsh_init_loader(&lig.to_string_lossy(), Some(&cache))).unwrap();
         assert_eq!(std::fs::metadata(&helper).unwrap().permissions().mode() & 0o777, 0o600);
+        let compiled = zsh_compiled_path(&helper);
+        assert_eq!(std::fs::metadata(&compiled).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(
+            std::process::Command::new("zsh")
+                .args(["-f", "-c", "builtin zcompile -t -- \"$1\" \"${2:t}\"", "test-zcompile"])
+                .arg(&compiled)
+                .arg(&helper)
+                .status()
+                .unwrap()
+                .success()
+        );
         std::fs::write(&rc, contents).unwrap();
         let run = || {
             let output = std::process::Command::new("zsh")
@@ -1751,9 +1903,20 @@ mod shell_tests {
         std::fs::set_permissions(cache_file("pre"), std::fs::Permissions::from_mode(0o666)).unwrap();
         run();
         assert_eq!(read("calls"), "pre\npost\npre\npre\npost\npre\n", "writable caches are regenerated");
-        remove_zsh_helper(&rc).unwrap();
+        remove_zsh_helper(&helper).unwrap();
         assert!(!helper.exists());
+        assert!(!zsh_compiled_path(&helper).exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zsh_cache_path_uses_xdg_or_home_dotcache_on_every_platform() {
+        let home = std::env::temp_dir().join("lig-test-home");
+        let xdg = home.join("custom cache");
+        assert_eq!(resolve_zsh_cache_dir(None, Some(home.clone())).unwrap(), home.join(".cache/lig"));
+        assert_eq!(resolve_zsh_cache_dir(Some(PathBuf::new()), Some(home.clone())).unwrap(), home.join(".cache/lig"));
+        assert_eq!(resolve_zsh_cache_dir(Some(xdg.clone()), Some(home)).unwrap(), xdg.join("lig"));
+        assert!(resolve_zsh_cache_dir(None, None).is_err());
     }
 
     #[test]
@@ -1762,7 +1925,8 @@ mod shell_tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let rc = root.join(".zshrc");
-        let helper = zsh_helper_path(&rc).unwrap();
+        let helper = root.canonicalize().unwrap().join("cache/lig/lig-init.zsh");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
         let body = "# user config\n";
         let legacy = format!(
             "{PRE_BEGIN}\n{}\n_lig_load_init pre\n{PRE_END}\n{body}{POST_BEGIN}\n_lig_load_init post\n{POST_END}\n",
@@ -1770,27 +1934,34 @@ mod shell_tests {
         );
         std::fs::write(&rc, &legacy).unwrap();
         std::fs::write(&helper, "# user file\n").unwrap();
-        assert!(install_at(ShellKind::Zsh, &rc, "/tmp/lig").is_err());
+        assert!(install_at_with_helper(ShellKind::Zsh, &rc, "/tmp/lig", &helper).is_err());
         assert_eq!(std::fs::read_to_string(&rc).unwrap(), legacy);
-        remove_zsh_helper(&rc).unwrap();
+        remove_zsh_helper(&helper).unwrap();
         assert!(helper.exists());
         std::fs::remove_file(&helper).unwrap();
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&rc, &helper).unwrap();
-            assert!(install_at(ShellKind::Zsh, &rc, "/tmp/lig").is_err());
+            assert!(install_at_with_helper(ShellKind::Zsh, &rc, "/tmp/lig", &helper).is_err());
             std::fs::remove_file(&helper).unwrap();
         }
-        install_at(ShellKind::Zsh, &rc, "/tmp/lig").unwrap();
+        let old_helper = rc.with_file_name(".lig-init.zsh");
+        std::fs::write(&old_helper, zsh_init_loader("/tmp/lig", None)).unwrap();
+        install_at_with_helper(ShellKind::Zsh, &rc, "/tmp/lig", &helper).unwrap();
+        assert!(!old_helper.exists(), "migration removes the generated helper next to the profile");
+        assert!(zsh_compiled_path(&helper).exists());
         let first = std::fs::read_to_string(&rc).unwrap();
         assert!(!first.contains("_lig_load_init()"));
         assert_eq!(managed_body(&first).unwrap(), body);
         assert_eq!(std::fs::read_to_string(root.join(".zshrc.lig-backup")).unwrap(), legacy);
-        install_at(ShellKind::Zsh, &rc, "/tmp/updated lig").unwrap();
+        // Word code is disposable: reinstall repairs it without changing the rc.
+        std::fs::write(zsh_compiled_path(&helper), "damaged compiled cache").unwrap();
+        install_at_with_helper(ShellKind::Zsh, &rc, "/tmp/updated lig", &helper).unwrap();
         assert_eq!(std::fs::read_to_string(&rc).unwrap(), first);
         assert!(std::fs::read_to_string(&helper).unwrap().contains("binary='/tmp/updated lig'"));
-        remove_zsh_helper(&rc).unwrap();
+        remove_zsh_helper(&helper).unwrap();
         assert!(!helper.exists());
+        assert!(!zsh_compiled_path(&helper).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
