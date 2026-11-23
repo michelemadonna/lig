@@ -82,6 +82,8 @@ Optional: `curl` for package search, a [Nerd Font](https://www.nerdfonts.com) fo
 `lig install` adds a few lines to your shell's config file (`~/.zshrc`, `~/.bashrc`,
 `config.fish`, `config.nu` or the PowerShell profile), backing it up first; to add them
 yourself, see [Set up a shell by hand](#set-up-a-shell-by-hand).
+In Zsh, Lig also cooperates with `zsh-autosuggestions`: inserted text refreshes the suggestion,
+and Lig's completion query preserves its highlight.
 Prebuilt archives, `.deb` and `.rpm` files are on the
 [releases page](https://github.com/KevenGoncalves/lig/releases/latest).
 

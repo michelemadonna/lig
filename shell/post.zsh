@@ -160,6 +160,31 @@ if [[ -o interactive && -z "$LIG_DISABLE" && -n "$LIG_TTY" && "$LIG_TTY" == "$TT
   builtin bindkey -M viins '\e[9148~' _lig_ask
   builtin bindkey -M vicmd '\e[9148~' _lig_ask
 
+  # Completion can clamp the autosuggestion highlight to the typed buffer.
+  # Preserve and reapply it when zsh-autosuggestions is installed.
+  if [[ ${widgets[_lig_ask]-} == completion:* ]] &&
+      (( $+functions[_zsh_autosuggest_highlight_reset] &&
+         $+functions[_zsh_autosuggest_highlight_apply] )); then
+    builtin zle -A _lig_ask _lig_ask_original
+    _lig_ask_with_ghost() {
+      local input=$BUFFER
+      local -a input_highlight=("${region_highlight[@]}")
+      local -i completion_status=0
+      builtin zle _lig_ask_original -- "$@" || completion_status=$?
+      if [[ $BUFFER == "$input" ]]; then
+        region_highlight=("${input_highlight[@]}")
+      fi
+      if [[ -n $POSTDISPLAY ]]; then
+        _zsh_autosuggest_highlight_reset
+        _zsh_autosuggest_highlight_apply
+      fi
+      return $completion_status
+    }
+    builtin zle -N _lig_ask _lig_ask_with_ghost
+    typeset -ga ZSH_AUTOSUGGEST_IGNORE_WIDGETS
+    ZSH_AUTOSUGGEST_IGNORE_WIDGETS+=(_lig_ask _lig_ask_original)
+  fi
+
   # Ghostty's prompt marks (OSC 133) tell it the shell is idle, so closing it needs no confirmation.
   if [[ -n $LIG_GHOSTTY ]]; then
     builtin unset LIG_GHOSTTY
