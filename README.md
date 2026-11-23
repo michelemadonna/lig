@@ -82,10 +82,16 @@ Optional: `curl` for package search, a [Nerd Font](https://www.nerdfonts.com) fo
 `lig install` adds a few lines to your shell's config file (`~/.zshrc`, `~/.bashrc`,
 `config.fish`, `config.nu` or the PowerShell profile), backing it up first; to add them
 yourself, see [Set up a shell by hand](#set-up-a-shell-by-hand).
-For Zsh, the managed setup caches Lig's generated integration and refreshes it when the
-Lig binary or Zsh version changes. It uses the standard user cache directory only when its
-directory permissions are safe; otherwise it generates the integration directly. Hand-written
-`eval "$(lig init zsh …)"` blocks remain supported and continue to generate it directly.
+For Zsh, the managed setup writes the loader to `.lig-init.zsh` next to `.zshrc`
+(respecting `ZDOTDIR`). Only a `source` followed by `_lig_load_init pre` at the top and
+`_lig_load_init post` at the bottom are added to `.zshrc`. Running `lig install zsh` again
+updates the helper and replaces older inline loaders automatically. `lig uninstall zsh`
+also removes the generated helper; an unrelated file with that name is preserved.
+
+The loader caches the generated integration in the standard user cache directory and
+refreshes it when the Lig binary or Zsh version changes. If cache permissions are unsafe,
+it generates the integration directly. The helper persists independently of the cache.
+Hand-written `eval "$(lig init zsh …)"` blocks remain supported and generate it directly.
 Prebuilt archives, `.deb` and `.rpm` files are on the
 [releases page](https://github.com/KevenGoncalves/lig/releases/latest).
 
@@ -110,13 +116,29 @@ The install script puts `lig.exe` in `%LOCALAPPDATA%\Programs\lig` and on your `
 
 ### Set up a shell by hand
 
-If you keep your dotfiles yourself, add the lines `lig install` would. Each shell gets two
+If you keep your dotfiles yourself, use the direct initialization examples below. Each shell gets two
 blocks: the `pre` one goes at the **top** of the file, as it restarts the shell inside Lig
 (anything above it runs twice); the `post` one goes at the **end**, after your plugins and
 prompt, and connects the shell to the popup. Keep the marker comments: `lig doctor` and
 `lig uninstall` look for them. `lig` must be on your `PATH` (or write its full path).
 
-**zsh**, in `~/.zshrc`:
+For the managed Zsh cache setup, run `lig install zsh` to create the helper. With the
+usual home directory, the generated blocks look like this (the installer uses an absolute,
+quoted helper path):
+
+```zsh
+# >>> lig pre >>>
+builtin source '/home/you/.lig-init.zsh' && _lig_load_init pre
+# <<< lig pre <<<
+
+# ... the rest of your config ...
+
+# >>> lig post >>>
+_lig_load_init post
+# <<< lig post <<<
+```
+
+**zsh**, direct initialization in `~/.zshrc` (without the managed cache):
 
 ```zsh
 # >>> lig pre >>>
