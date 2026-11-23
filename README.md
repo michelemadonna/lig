@@ -253,6 +253,8 @@ Type as usual; the popup shows what fits.
   `history = false` keeps nothing and leaves `Ctrl+R` to the shell.
 - **Your shell's own keys stay yours**: history with the arrows, `Tab` once the popup is
   closed, fzf's `Ctrl+T`. Typing brings the popup back.
+- **Use Tab to open Lig on demand**: add `"tab"` to `toggle` as well as `next`. Tab opens
+  the popup when it is closed and moves through suggestions when it is open.
 
 ## Configuration
 

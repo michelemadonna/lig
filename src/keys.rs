@@ -459,6 +459,10 @@ impl Bindings {
         Bindings(v)
     }
 
+    pub fn has_action(&self, key: &Key, action: Action) -> bool {
+        self.0.iter().any(|(bound, candidate)| bound == key && *candidate == action)
+    }
+
     pub fn action(&self, key: &Key) -> Option<Action> {
         self.0.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
@@ -568,5 +572,13 @@ mod tests {
         for (_, key) in split(input) {
             assert_eq!(Key::parse_name(&key.name()), Some(key.clone()), "{}", key.name());
         }
+    }
+
+    #[test]
+    fn one_key_can_have_multiple_actions() {
+        let bindings = Bindings(vec![(Key::TAB, Action::Toggle), (Key::TAB, Action::Next)]);
+        assert!(bindings.has_action(&Key::TAB, Action::Toggle));
+        assert!(bindings.has_action(&Key::TAB, Action::Next));
+        assert_eq!(bindings.action(&Key::TAB), Some(Action::Toggle));
     }
 }

@@ -3,9 +3,10 @@
 import os
 import re
 import shutil
+import tempfile
 import unittest
 from pathlib import Path
-from fish_pty import Fish
+from fish_pty import BUFFER_KEY, Fish
 
 class ShellSmoke(unittest.TestCase):
     def test_bash_completed_operands_reach_commands(self):
@@ -99,6 +100,35 @@ class ShellSmoke(unittest.TestCase):
             term.wait_popup('checkout', start)
         finally:
             self.assertEqual(term.close(17), 17)
+
+    def test_zsh_tab_opens_popup_then_moves_selection(self):
+        shell = os.environ.get('LIG_TEST_ZSH') or shutil.which('zsh')
+        if not shell:
+            self.skipTest('zsh is unavailable')
+        previous_path = os.environ.get('PATH', '')
+        with tempfile.TemporaryDirectory(prefix='lig-zsh-tab-') as directory:
+            commands = Path(directory)
+            for name in ('jump', 'jumper'):
+                command = commands / name
+                command.write_text('#!/bin/sh\nexit 0\n')
+                command.chmod(0o755)
+            os.environ['PATH'] = str(commands) + os.pathsep + previous_path
+            term = None
+            try:
+                term = Fish(wrapped=True, shell=shell, lig_config='[keys]\ntoggle = ["ctrl-space", "tab"]\n')
+                term.send('jum')
+                start = len(term.output)
+                term.send(b'\t')
+                term.wait_popup('jump', start)
+                term.send(b'\t')
+                term.send(b'\r')
+                term.send(BUFFER_KEY)
+                term.wait_for(lambda: (term.home / 'buffer').exists())
+                self.assertEqual((term.home / 'buffer').read_text().strip(), 'jumper')
+            finally:
+                if term is not None:
+                    self.assertEqual(term.close(17), 17)
+                os.environ['PATH'] = previous_path
 
     def smoke(self, shell, extra=''):
         term = Fish(wrapped=True, shell=shell, extra_config=extra)

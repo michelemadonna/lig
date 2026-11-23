@@ -578,6 +578,10 @@ fn push_typed(typed: &mut Option<String>, key: &Key) {
 /// `auto`: unless the word already equals a suggestion; `after-space`: only after a space;
 /// `always`: while the popup is open. A navigated selection is always picked; except with
 /// `always`, the Enter right after a pick runs the line.
+fn toggle_on_key(bindings: &Bindings, key: &Key, popup_open: bool) -> bool {
+    bindings.has_action(key, Action::Toggle) && (!popup_open || !bindings.has_action(key, Action::Next))
+}
+
 fn enter_accepts(mode: &str, word_empty: bool, complete: bool, navigated: bool, just_accepted: bool) -> bool {
     match mode {
         "never" => false,
@@ -1793,7 +1797,7 @@ impl Session {
                 redraw = true;
                 continue;
             }
-            if self.bindings.action(&key) == Some(Action::Toggle) && self.can_show() {
+            if toggle_on_key(&self.bindings, &key, self.popup_open()) && self.can_show() {
                 self.toggle();
                 redraw = true;
                 continue;
@@ -2497,6 +2501,19 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_toggles_when_closed_and_navigates_when_open() {
+        let mut keys = crate::config::Keys::default();
+        keys.toggle.push("tab".into());
+        let both = Bindings::new(&keys);
+        assert!(toggle_on_key(&both, &Key::TAB, false));
+        assert!(!toggle_on_key(&both, &Key::TAB, true));
+
+        keys.next.retain(|key| key != "tab");
+        let toggle_only = Bindings::new(&keys);
+        assert!(toggle_on_key(&toggle_only, &Key::TAB, true));
+    }
 
     #[test]
     fn fish_refresh_rejects_stale_replies_and_stays_idle_after_ack() {
