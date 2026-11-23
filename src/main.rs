@@ -22,6 +22,7 @@ mod nushell;
 mod osc;
 mod parser;
 mod popup;
+mod preview;
 mod process;
 #[cfg(target_os = "linux")]
 mod procfs;

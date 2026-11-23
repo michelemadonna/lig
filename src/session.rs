@@ -1,6 +1,9 @@
 //! `lig shell`: runs the shell in a PTY, mirrors its screen with vt100 and draws the suggestion popup.
 //! Input, output and resizes feed one event loop ([`Session`]); completion runs on a worker thread.
 
+#[path = "preview/session.rs"]
+mod previews;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -71,7 +74,10 @@ enum Event {
     Input(Vec<u8>),
     Output(Vec<u8>),
     Exit,
+    #[cfg(unix)]
+    Shutdown(i32),
     Resize,
+    PreviewReady(u64, std::sync::Arc<crate::preview::Document>),
     /// Suggestions for `line`; `loading` names what is still being fetched; `command` is the
     /// command they complete, aliases expanded.
     Done {
@@ -376,14 +382,19 @@ pub fn run(shell: PathBuf, login: bool) -> Result<i32> {
         shell.display(),
         typeahead.len()
     ));
-    let mut parser = vt100::Parser::new(rows, cols, usize::from(rows));
+    let cfg = Config::load();
+    let scrollback = if cfg.preview.enabled { previews::PROMPT_HISTORY } else { usize::from(rows) };
+    let mut parser = vt100::Parser::new(rows, cols, scrollback);
     if let Some((row, col)) = origin {
         parser.process(format!("\x1b[{};{}H", row.min(rows), col.min(cols)).as_bytes());
     }
-    let cfg = Config::load();
     crate::icons::set_overrides(&cfg.icons);
 
     let (tx, rx) = unbounded::<Event>();
+    #[cfg(unix)]
+    if cfg.preview.enabled {
+        previews::watch_shutdown(tx.clone())?;
+    }
     if !typeahead.is_empty() {
         let _ = tx.send(Event::Input(typeahead));
     }
@@ -406,6 +417,8 @@ pub fn run(shell: PathBuf, login: bool) -> Result<i32> {
     let (req_tx, req_rx) = unbounded::<Request>();
     let behavior = cfg.behavior.clone();
     let events = tx.clone();
+    let bindings = Bindings::new(&cfg.keys);
+    let preview = cfg.preview.enabled.then(|| previews::State::new(&cfg.preview, &bindings, tx.clone()));
     std::thread::spawn(move || worker(req_rx, tx, behavior));
     std::thread::spawn(crate::help::prune_cache);
 
@@ -430,13 +443,14 @@ pub fn run(shell: PathBuf, login: bool) -> Result<i32> {
         prompt_end: None,
         shell_nav: false,
         cwd_fallback: std::env::current_dir().unwrap_or_else(|_| "/".into()),
-        bindings: Bindings::new(&cfg.keys),
+        bindings,
         shell_asked: None,
         history: cfg.behavior.history.then(crate::history::History::open),
         history_mode: false,
         history_folder: false,
         run_after_insert: None,
         cfg,
+        preview,
         pty: writer,
         shell_pty: pty_handle,
         parser,
@@ -487,13 +501,19 @@ pub fn run(shell: PathBuf, login: bool) -> Result<i32> {
         dirty_since: Instant::now(),
         last_output: Instant::now(),
     };
-    s.event_loop(&rx);
+    let signal = s.event_loop(&rx);
 
     s.clear_popup();
+    drop(s.preview.take());
+    #[cfg(unix)]
+    if signal.is_some() {
+        previews::terminate_shell(s.shell_pid);
+    }
     let _ = std::fs::remove_file(&s.insert_file);
     let _ = std::fs::remove_file(&s.query_file);
     drop(raw);
-    Ok(s.shell_pty.wait())
+    let status = s.shell_pty.wait();
+    Ok(signal.map_or(status, |signal| 128 + signal))
 }
 
 fn spawn_stdin_reader(tx: Sender<Event>) {
@@ -826,6 +846,7 @@ struct Session {
     unconfirmed_at: Instant,
     fish_refresh: Option<FishRefresh>,
     cfg: Config,
+    preview: Option<previews::State>,
     /// The line the shell was last asked about (see [`ZSH_COMPLETE_KEY`]).
     shell_asked: Option<String>,
     /// The commands that ran (`behavior.history`), and whether the popup shows them now.
@@ -922,9 +943,10 @@ struct Session {
 }
 
 impl Session {
-    fn event_loop(&mut self, rx: &Receiver<Event>) {
+    fn event_loop(&mut self, rx: &Receiver<Event>) -> Option<i32> {
         loop {
             self.resync_tick();
+            self.preview_tick();
             if self.fish_refresh.as_ref().and_then(FishRefresh::wake).is_some_and(|due| due <= Instant::now()) {
                 self.fish_sequence += 1;
                 if self.fish_refresh.as_mut().unwrap().take_due(self.fish_sequence) {
@@ -981,6 +1003,9 @@ impl Session {
                 let w = self.last_output + PROMPT_SETTLE;
                 deadline = Some(deadline.map_or(w, |d| d.min(w)));
             }
+            if let Some(w) = self.preview_wake() {
+                deadline = Some(deadline.map_or(w, |d| d.min(w)));
+            }
             let ev = if let Some(due) = deadline {
                 match rx.recv_deadline(due) {
                     Ok(ev) => ev,
@@ -1017,12 +1042,12 @@ impl Session {
                         self.render();
                         continue;
                     }
-                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Disconnected) => return None,
                 }
             } else {
                 match rx.recv() {
                     Ok(ev) => ev,
-                    Err(_) => return,
+                    Err(_) => return None,
                 }
             };
             match ev {
@@ -1031,6 +1056,7 @@ impl Session {
                     None => self.on_output(&data),
                 },
                 Event::Input(mut data) => {
+                    data = self.preview_terminal_input(data);
                     if let Some(r) = self.resync.as_mut().filter(|r| r.asked.is_some()) {
                         data.splice(0..0, std::mem::take(&mut r.partial));
                         if let Some(report) = take_cursor_report(&mut data) {
@@ -1050,7 +1076,7 @@ impl Session {
                         self.shell_cursor_queries = self.shell_cursor_queries.saturating_sub(cursor_reports(&data));
                     }
                     if !data.is_empty() {
-                        self.on_input(&data);
+                        self.on_preview_input(&data);
                     }
                 }
                 Event::Done { line, items, loading, command, ask_shell } => {
@@ -1060,6 +1086,7 @@ impl Session {
                     self.on_done(line, items, loading, command)
                 }
                 Event::Resize => self.on_resize(),
+                Event::PreviewReady(id, document) => self.on_preview_ready(id, document),
                 // The local nu's, even when they come during a `lig ssh`.
                 Event::ShellSpecs(specs) => match &mut self.remote {
                     Some(r) => r.local_env.shell_specs = Some(specs),
@@ -1102,7 +1129,9 @@ impl Session {
                         }
                     }
                 }
-                Event::Exit => return,
+                Event::Exit => return None,
+                #[cfg(unix)]
+                Event::Shutdown(signal) => return Some(signal),
             }
         }
     }
@@ -1172,6 +1201,7 @@ impl Session {
     }
 
     fn erase(&mut self, w: &mut Vec<u8>) {
+        self.erase_preview(w);
         if let Some(r) = self.drawn.take() {
             self.begin_sync(w);
             popup::erase(w, self.parser.screen(), r);
@@ -1264,7 +1294,7 @@ impl Session {
             let next_msg = msgs.peek().map(|&(pos, _)| pos);
             let Some(pos) = next_msg.into_iter().chain(marks.peek().copied()).min() else { break };
             w.extend_from_slice(&fwd[at..pos]);
-            self.parser.process(&fwd[at..pos]);
+            self.process_preview_output(&fwd[at..pos]);
             at = pos;
             if next_msg == Some(pos) {
                 let (_, m) = msgs.next().unwrap();
@@ -1275,13 +1305,16 @@ impl Session {
                 // The terminal starts a new line at a prompt mark; do it here so vt100 does too.
                 if self.parser.screen().cursor_position().1 != 0 {
                     w.extend_from_slice(b"\r\n");
-                    self.parser.process(b"\r\n");
+                    self.process_preview_output(b"\r\n");
+                }
+                if let Some(preview) = &mut self.preview {
+                    preview.mark_prompt(self.parser.screen_mut());
                 }
             }
         }
         w.extend_from_slice(&fwd[at..]);
         self.write_out(&w);
-        self.parser.process(&fwd[at..]);
+        self.process_preview_output(&fwd[at..]);
         if before.is_some_and(|b| b != self.screen_state())
             && let Some(refresh) = &mut self.fish_refresh
         {
@@ -1323,6 +1356,9 @@ impl Session {
         crate::log(&format!("buffer cursor={cursor} characters={}", text.chars().count()));
         self.editing = true;
         self.hidden = false;
+        if let Some(preview) = &mut self.preview {
+            preview.input_tail = text.chars().skip(cursor).collect();
+        }
         self.set_line(text.chars().take(cursor).collect());
     }
 
@@ -1390,6 +1426,9 @@ impl Session {
     }
 
     fn reset_line(&mut self) {
+        if let Some(preview) = &mut self.preview {
+            preview.reset_prompt();
+        }
         self.editing = false;
         self.foreign = false;
         self.unconfirmed.clear();
@@ -1557,6 +1596,9 @@ impl Session {
             }
             Msg::Finish => {
                 crate::log("reader finished");
+                if let Some(preview) = &mut self.preview {
+                    preview.reset_prompt();
+                }
                 self.history_mode = false;
                 self.fish_refresh = None;
                 self.unconfirmed.clear();
@@ -1579,6 +1621,9 @@ impl Session {
             }
             Msg::Path(p) => self.env.path = Some(p),
             Msg::Cwd(c) => {
+                if let Some(preview) = &mut self.preview {
+                    preview.mark_prompt(self.parser.screen_mut());
+                }
                 // Follow the shell's cwd so hosts reading ours from `/proc` inherit it.
                 if self.remote.is_none() {
                     let _ = std::env::set_current_dir(&c);
@@ -1629,6 +1674,9 @@ impl Session {
         let mut env = self.env.clone();
         if env.cwd.as_os_str().is_empty() {
             env.cwd = self.shell_pid.and_then(crate::process::cwd).unwrap_or_else(|| self.cwd_fallback.clone());
+        }
+        if let Some(preview) = &mut self.preview {
+            preview.cwd.clone_from(&env.cwd);
         }
         let _ = self.req_tx.send(Request { line: self.line.clone(), env, manual: self.manual });
         // Loading until answered (the worker may be busy with an older request);
@@ -1816,6 +1864,10 @@ impl Session {
                 push_typed(&mut typed, &key);
                 fwd.extend_from_slice(raw);
                 passthrough = true;
+                continue;
+            }
+            if self.preview_key(&key) {
+                redraw = true;
                 continue;
             }
             let mut action = self.bindings.action(&key);
@@ -2216,6 +2268,7 @@ impl Session {
     /// its content went (see [`Resync`]).
     fn on_resize(&mut self) {
         let Some((rows, cols)) = term::size() else { return };
+        self.preview_resizing((rows, cols));
         self.shell_pty.resize(rows, cols, term::pixels());
         let ask_at = Instant::now() + RESIZE_SETTLE;
         match &mut self.resync {
@@ -2302,6 +2355,7 @@ impl Session {
         if let Some(prompt) = &mut self.prompt_end {
             prompt.row = (i32::from(prompt.row) - shift).clamp(0, i32::from(rows) - 1) as u16;
         }
+        self.preview_shift(shift, rows, cols != old_cols);
         self.drawn = self.drawn.and_then(|rect| shifted(rect, shift, rows));
         self.shown = self.shown.and_then(|rect| shifted(rect, shift, rows));
         if shift < 0 || cols != old_cols {
@@ -2380,6 +2434,7 @@ impl Session {
         crate::log(&format!("config: theme {} reloaded", ui.theme));
         self.cfg.ui.theme = ui.theme;
         self.cfg.ui.colors = ui.colors;
+        self.preview_theme_changed();
         true
     }
 
@@ -2398,7 +2453,7 @@ impl Session {
         if !stuck.is_empty() {
             self.erase(&mut w);
             w.extend_from_slice(&stuck);
-            self.parser.process(&stuck);
+            self.process_preview_output(&stuck);
         }
         let fresh = self.visible();
         if fresh {
@@ -2441,7 +2496,7 @@ impl Session {
                 let bytes =
                     format!("\x1b[{rows};1H{}\x1b[{};{}H", "\n".repeat(usize::from(scroll)), row + 1 - scroll, col + 1);
                 w.extend_from_slice(bytes.as_bytes());
-                self.parser.process(bytes.as_bytes());
+                self.process_preview_output(bytes.as_bytes());
                 if let Some(prompt) = &mut self.prompt_end {
                     prompt.row = prompt.row.saturating_sub(scroll);
                 }
@@ -2454,6 +2509,10 @@ impl Session {
         // Kept suggestions stay put: their anchor (`delete`) is for the old line.
         if keep && let (Some(l), Some(old)) = (layout.as_mut(), self.shown) {
             l.rect.col = old.col.min(self.parser.screen().size().1.saturating_sub(l.rect.width));
+        }
+        if self.preview.is_some() {
+            let known = self.known_from();
+            self.sync_preview(&mut layout, &shown, fresh && !is_message, known);
         }
         if std::env::var_os("LIG_LOG").is_some() {
             crate::log(&format!(
@@ -2475,6 +2534,7 @@ impl Session {
             (Some(l), Some(old)) if l.rect == old => {}
             _ => self.erase(&mut w),
         }
+        self.reconcile_preview(&mut w);
         if let Some(l) = layout {
             let h = l.visible();
             if self.selected < self.scroll {
@@ -2486,6 +2546,7 @@ impl Session {
             self.begin_sync(&mut w);
             let (selected, scroll) = if is_message { (usize::MAX, 0) } else { (self.selected, self.scroll) };
             popup::draw(&mut w, &self.cfg.ui, &l, &shown, selected, scroll);
+            self.draw_preview(&mut w);
             popup::restore_cursor(&mut w, self.parser.screen());
             self.drawn = Some(l.rect);
         }

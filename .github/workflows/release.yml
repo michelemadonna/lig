@@ -80,6 +80,15 @@ jobs:
         run: cargo test --locked
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Check static musl linking
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          bin="target/${{ matrix.target }}/release/lig"
+          headers="$(readelf -l -d "$bin")"
+          if grep -E 'INTERP|\(NEEDED\)' <<< "$headers"; then
+            echo 'The musl release must be statically linked'
+            exit 1
+          fi
       - name: Check the binary runs
         if: matrix.target != 'aarch64-pc-windows-msvc'
         run: target/${{ matrix.target }}/release/lig --version

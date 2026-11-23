@@ -29,6 +29,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           python3 tests/shell_smoke.py
+          python3 tests/preview_pty.py PreviewPTY.test_native_archive_and_webp_without_tools
           python3 tests/fish_pty.py
           python3 tests/nu_tmux.py
           python3 tests/interrupt_tmux.py
@@ -42,6 +43,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           python3 tests/shell_smoke.py
+          python3 tests/preview_pty.py PreviewPTY.test_native_archive_and_webp_without_tools
           python3 tests/interrupt_tmux.py
           python3 tests/winsize_pty.py
           python3 tests/zellij_mirror.py

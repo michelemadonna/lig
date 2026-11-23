@@ -38,6 +38,7 @@ pub struct Config {
     pub colors: Colors,
     pub keys: Keys,
     pub behavior: Behavior,
+    pub preview: crate::preview::Config,
     /// Icon overrides by name: a kind or icon name (`folder`, `git-branch`;
     /// `lig icons` lists them), `"*.rs"` for files by extension, or a file name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -349,6 +350,7 @@ impl Default for Behavior {
 impl Config {
     pub fn parse(text: &str) -> Result<Config, toml::de::Error> {
         let mut c = toml::from_str::<Config>(text)?;
+        c.preview.validate().map_err(<toml::de::Error as serde::de::Error>::custom)?;
         // `[colors]`, over the older `[ui.colors]`; drawing reads them from `ui`.
         c.ui.colors = c.colors.clone().or(std::mem::take(&mut c.ui.colors));
         Ok(c)

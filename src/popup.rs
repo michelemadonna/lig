@@ -47,6 +47,7 @@ fn style(ui: &Ui) -> Style {
     }
 }
 
+#[derive(Clone)]
 pub struct Layout {
     pub rect: Rect,
     style: Style,
@@ -76,6 +77,19 @@ impl Layout {
     /// Rows available for suggestions.
     pub fn visible(&self) -> usize {
         (self.rect.height - self.chrome_h() - self.frame_h()) as usize
+    }
+
+    /// Make room for a floating preview while keeping at least one candidate.
+    pub fn compact_height(&self, rows: u16, above_prompt: bool) -> Option<Self> {
+        let height = self.rect.height.checked_sub(rows)?;
+        let available = height.checked_sub(self.chrome_h() + 1)?;
+        let mut layout = self.clone();
+        layout.frame_lines = self.frame_lines.min(available.saturating_sub(frame_height(1, self.border_w()) - 1));
+        layout.rect.height = height;
+        if above_prompt {
+            layout.rect.row += rows;
+        }
+        Some(layout)
     }
 }
 

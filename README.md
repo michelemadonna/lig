@@ -256,6 +256,8 @@ Type as usual; the popup shows what fits.
 
 ## Configuration
 
+[File previews](docs/preview.md) cover native engines, optional external tools, and inline or floating layouts.
+
 Settings live in `~/.config/lig/config.toml`. `lig config` prints every option with its
 default; the common ones:
 
