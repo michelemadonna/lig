@@ -466,6 +466,11 @@ impl Bindings {
     pub fn action(&self, key: &Key) -> Option<Action> {
         self.0.iter().find(|(k, _)| k == key).map(|(_, a)| *a)
     }
+
+    pub fn actions(&self, key: &Key) -> impl Iterator<Item = Action> + '_ {
+        let key = key.clone();
+        self.0.iter().filter_map(move |(bound, action)| (bound == &key).then_some(*action))
+    }
 }
 
 /// `lig keys`: prints each pressed key's name and binding; `q` or Ctrl-C quits.
@@ -485,7 +490,12 @@ pub fn show(bindings: &Bindings) -> anyhow::Result<()> {
             if key == Key::plain(Code::Char('q')) || key == Key::ctrl('c') {
                 break 'read;
             }
-            let bound = bindings.action(&key).map_or("-".to_string(), |a| format!("{a:?}").to_lowercase());
+            let bound = bindings
+                .actions(&key)
+                .map(|action| format!("{action:?}").to_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let bound = if bound.is_empty() { "-".into() } else { bound };
             write!(out, "  {:<18} {:<20} {bound}\r\n", escape(bytes), key.name())?;
             out.flush()?;
         }
@@ -529,6 +539,14 @@ mod tests {
         assert_eq!(keys(b"\x1b[9;5u\x1b[27;5;9~\x1b[97;7u\x1b[65;2u"), ["ctrl-tab", "ctrl-tab", "ctrl-alt-a", "A"]);
         assert_eq!(keys(b"\r\n\x1b[106;5u\x1b[109;5u"), ["enter", "ctrl-j", "ctrl-j", "enter"]);
         assert_eq!(keys(b"\x1b[99;3x"), ["\\x1b[99;3x"]);
+    }
+
+    #[test]
+    fn reports_every_binding_for_a_shared_key() {
+        let mut config = crate::config::Keys::default();
+        config.toggle.push("tab".into());
+        let bindings = Bindings::new(&config);
+        assert_eq!(bindings.actions(&Key::TAB).collect::<Vec<_>>(), [Action::Next, Action::Toggle]);
     }
 
     #[test]

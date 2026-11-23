@@ -268,7 +268,7 @@ border = "rounded"         # square, none
 icons = "auto"             # nerd, unicode, none
 height = 8                 # max rows, or "30%"
 
-[keys]                     # `lig keys` shows any key's name
+[keys]                     # `lig keys` shows key names and all configured actions
 accept = ["enter"]
 next = ["tab", "down", "ctrl-n"]
 toggle = ["ctrl-space"]
@@ -298,6 +298,14 @@ match_fg = "214"           # also bg, fg, selected_fg, description_fg, border_fg
 folder = "📁"              # a glyph,
 git-branch = { color = "208" }               # a color,
 "*.rs" = { glyph = "🦀", color = "#dea584" }  # or both; by extension or file name too
+```
+
+To enable on-demand Tab, update the `[keys]` section:
+
+```toml
+[keys]
+next = ["tab", "down", "ctrl-n"]
+toggle = ["ctrl-space", "tab"]
 ```
 
 Try styles without editing anything: `lig preview --all`, `lig preview --theme nord`,

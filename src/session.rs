@@ -579,7 +579,9 @@ fn push_typed(typed: &mut Option<String>, key: &Key) {
 /// `always`: while the popup is open. A navigated selection is always picked; except with
 /// `always`, the Enter right after a pick runs the line.
 fn toggle_on_key(bindings: &Bindings, key: &Key, popup_open: bool) -> bool {
-    bindings.has_action(key, Action::Toggle) && (!popup_open || !bindings.has_action(key, Action::Next))
+    let action = bindings.action(key);
+    (!popup_open && action == Some(Action::Next) && bindings.has_action(key, Action::Toggle))
+        || action == Some(Action::Toggle)
 }
 
 fn enter_accepts(mode: &str, word_empty: bool, complete: bool, navigated: bool, just_accepted: bool) -> bool {
@@ -2513,6 +2515,19 @@ mod tests {
         keys.next.retain(|key| key != "tab");
         let toggle_only = Bindings::new(&keys);
         assert!(toggle_on_key(&toggle_only, &Key::TAB, true));
+    }
+
+    #[test]
+    fn toggle_does_not_override_higher_priority_bindings() {
+        for (key, action) in [("enter", Action::Accept), ("up", Action::Prev), ("esc", Action::Dismiss)] {
+            let mut keys = crate::config::Keys::default();
+            keys.toggle.push(key.into());
+            let bindings = Bindings::new(&keys);
+            let key = Key::parse_name(key).unwrap();
+            assert!(!toggle_on_key(&bindings, &key, false));
+            assert!(!toggle_on_key(&bindings, &key, true));
+            assert_eq!(bindings.action(&key), Some(action));
+        }
     }
 
     #[test]
