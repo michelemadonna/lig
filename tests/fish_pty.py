@@ -322,6 +322,96 @@ class FishTests(unittest.TestCase):
         self.assertRegex(out, rb'\x1b\]6973;R;[0-9]+\x07')
 
 class WrappedTests(unittest.TestCase):
+    def test_toggle_only_completion(self):
+        shell = FISH or shutil.which('zsh') or shutil.which('bash')
+        spec = '{"name":"dotpick","args":{"name":"path","template":"filepaths","isVariadic":true}}'
+        fish = Fish(wrapped=True, shell=shell,
+                    lig_config='[behavior]\ntoggle_only = true\ncomplete_commands = true\n',
+                    after_config='cd "$HOME"\n', specs={'dotpick': spec})
+        try:
+            (fish.home / '.hidden-choice').write_text('')
+            (fish.home / '.ssh').mkdir()
+            start = len(fish.output)
+            fish.send('car')
+            fish.read(.35)
+            self.assertNotIn(POPUP, fish.output[start:], fish.plain(start))
+            fish.clear()
+
+            start = len(fish.output)
+            fish.send('dotpick .hid')
+            fish.read(.35)
+            self.assertNotIn(POPUP, fish.output[start:], fish.plain(start))
+            fish.send(b'\x00')
+            fish.wait_popup('.hidden-choice', start)
+            # Picking a file closes the popup, and that ends the toggle: the next word doesn't
+            # bring it back.
+            start = len(fish.output)
+            fish.send('\r')
+            fish.wait_for(lambda: b'hidden-choice' in fish.plain(start))
+            fish.read(.3)
+            start = len(fish.output)
+            fish.send(' ')
+            fish.read(.35)
+            self.assertNotIn(POPUP, fish.output[start:], fish.plain(start))
+            fish.clear()
+
+            start = len(fish.output)
+            fish.send('cd .ss')
+            fish.read(.35)
+            self.assertNotIn(POPUP, fish.output[start:], fish.plain(start))
+            fish.send(b'\x00')
+            fish.wait_popup('.ssh/', start)
+            fish.clear()
+
+            start = len(fish.output)
+            fish.send('git ch')
+            fish.read(.35)
+            self.assertNotIn(POPUP, fish.output[start:], fish.plain(start))
+
+            fish.send(b'\x00')
+            fish.wait_popup('checkout', start)
+
+            start = len(fish.output)
+            fish.send('e')
+            fish.wait_popup('checkout', start)
+
+            fish.send(b'\x00')
+            fish.read(.2)
+            start = len(fish.output)
+            fish.send('r')
+            fish.read(.35)
+            self.assertNotIn(POPUP, fish.output[start:], fish.plain(start))
+
+            fish.send(b'\x03')
+            start = len(fish.output)
+            fish.send('printf toggle-only-ok > "$HOME/result"\r')
+            fish.wait_for(lambda: (fish.home / 'result').exists())
+            self.assertNotIn(POPUP, fish.output[start:], fish.plain(start))
+        finally:
+            fish.close()
+
+    def test_wrap_around_goes_from_the_first_suggestion_to_the_last(self):
+        """With `behavior.wrap_around` (#68), Up on the first suggestion selects the last; without
+        it, Up there closes the popup and leaves the line as typed."""
+        spec = '{"name":"wrapme","args":{"name":"word","suggestions":["one","two","three"]}}'
+        # `buffer()` reads the line stripped: `wrapme ` as typed is `wrapme`.
+        cases = [(False, 1, 'wrapme'), (True, 1, 'wrapme three'), (True, 2, 'wrapme two')]
+        for wrap, ups, line in cases:
+            with self.subTest(wrap_around=wrap, ups=ups):
+                fish = Fish(wrapped=True, specs={'wrapme': spec},
+                            lig_config=f'[behavior]\nwrap_around = {str(wrap).lower()}\n')
+                try:
+                    start = len(fish.output)
+                    fish.send('wrapme ')
+                    fish.wait_popup('three', start)
+                    for _ in range(ups):
+                        fish.send(b'\x1b[A')
+                    if wrap:
+                        fish.send(b'\r')  # picks the selected one; it doesn't run the line
+                    fish.assert_buffer(line)
+                finally:
+                    fish.close()
+
     def test_missing_snapshot_reply_recovers_without_a_new_prompt(self):
         hook = r"""
 functions --erase __lig_report

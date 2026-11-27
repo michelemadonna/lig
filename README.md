@@ -223,7 +223,7 @@ Type as usual; the popup shows what fits.
 | Key | Action |
 | --- | --- |
 | `Tab` / `↓` | next suggestion |
-| `Shift-Tab` / `↑` | previous suggestion (on the first one: close the popup) |
+| `Shift-Tab` / `↑` | previous suggestion (on the first one: close the popup, or go to the last with `wrap_around`) |
 | `Enter` | accept the suggestion |
 | `Shift+Enter` | accept the suggestion and run the line |
 | `Esc` | close the popup |
@@ -239,6 +239,9 @@ Type as usual; the popup shows what fits.
   bind `accept_and_run = ["alt-enter"]`.
 - **Command names** don't pop up by themselves, so simple commands run with one `Enter`.
   `Ctrl+Space` shows them; `complete_commands = true` always does.
+- **Only on demand**: with `toggle_only = true` nothing pops up by itself; `Ctrl+Space`
+  opens the popup, which follows the line until you pick a finished word, press `Esc` or
+  `Ctrl+Space` again.
 - **Folders** (`cd`, `mkdir`…) keep the popup open with the subfolders, with **↵ Enter** to
   run the line and **Back** to go up.
 - **File commands** (`ls`, `cp`, `mv`, `rm`…) show their files first and their options once
@@ -249,12 +252,13 @@ Type as usual; the popup shows what fits.
 - **History** (`Ctrl+R`) lists the commands you ran, in every Lig session, newest first
   and each once; typing narrows it (fuzzy), and `Enter` puts one on the line. `Alt+R` lists
   only those you ran in the current folder, marked `local` (and `Ctrl+R` switches back). It
-  starts with what zsh, bash, fish and nu remember; in `lig ssh` and `lig mosh` it's the
+  starts with what zsh, bash, fish and nu remember (zsh's and bash's `HISTFILE` too, wherever
+  it points); in `lig ssh` and `lig mosh` it's the
   server's history instead. A command typed with a leading space isn't kept;
   `history_success_only = true` keeps only those that ran without error, and
   `history = false` keeps nothing and leaves `Ctrl+R` to the shell.
 - **Your shell's own keys stay yours**: history with the arrows, `Tab` once the popup is
-  closed, fzf's `Ctrl+T`. Typing brings the popup back.
+  closed, fzf's `Ctrl+T`. Typing brings the popup back unless `toggle_only = true`.
 
 ## Configuration
 
@@ -280,6 +284,8 @@ accept_and_run = ["shift-enter"]  # or ["alt-enter"] where Shift+Enter sends a p
 enter_accepts = "auto"     # "always", "after-space", "never"
 enter_runs_commands = []   # Enter picks and runs in one press, e.g. ["z", "zi"]
 complete_commands = false  # pop up for command names too
+toggle_only = false        # true: open completions only with keys.toggle
+wrap_around = false        # true: Up on the first suggestion goes to the last, not closing
 options_after_dash = ["ls", "cp", "mv", "rm"]  # options only after -; "*" for all
 show_hidden_files = false  # list dot files without typing a dot first
 hide_variable_values = []  # also mask these $VARS' values: ["GH_*", "*_URL"], "*" for all
@@ -299,6 +305,11 @@ folder = "📁"              # a glyph,
 git-branch = { color = "208" }               # a color,
 "*.rs" = { glyph = "🦀", color = "#dea584" }  # or both; by extension or file name too
 ```
+
+With `toggle_only = true`, Lig keeps the popup closed while you type. Press the key in
+`keys.toggle` (`Ctrl+Space` by default) to open it; while open, suggestions continue to update
+with the command line. Toggle it again or press `Esc` to close it; it also closes after a
+finished word. Until you toggle, Lig works out nothing for the line, so no registry is searched.
 
 Try styles without editing anything: `lig preview --all`, `lig preview --theme nord`,
 `lig icons`. A new `theme` or `[colors]` shows in open tabs too, so a light/dark switcher can
@@ -429,6 +440,7 @@ the scenes in zsh in a private tmux server, with `lig ssh` logging in to a throw
 
 Thanks to the contributors:
 
+- [@AdrielVelazquez](https://github.com/AdrielVelazquez)
 - [@albertomalossi](https://github.com/albertomalossi)
 - [@ammachado](https://github.com/ammachado)
 - [@aslan403](https://github.com/aslan403)
@@ -438,10 +450,12 @@ Thanks to the contributors:
 - [@JoelDeAriovaldo](https://github.com/JoelDeAriovaldo)
 - [@m-kat](https://github.com/m-kat)
 - [@mawkler](https://github.com/mawkler)
+- [@michelemadonna](https://github.com/michelemadonna)
 - [@mjsteinbaugh](https://github.com/mjsteinbaugh)
 - [@nadelacruz-00](https://github.com/nadelacruz-00)
 - [@oldmanniko-dev](https://github.com/oldmanniko-dev)
 - [@romainharlaut](https://github.com/romainharlaut)
+- [@rrittste](https://github.com/rrittste)
 - [@techwizrd](https://github.com/techwizrd)
 - [@thomasaarholt](https://github.com/thomasaarholt)
 - [@vishudhshah](https://github.com/vishudhshah)
