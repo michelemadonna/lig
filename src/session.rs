@@ -428,6 +428,8 @@ pub fn run(shell: PathBuf, login: bool) -> Result<i32> {
         query_file,
         fish_sequence: 0,
         unknown_rows: origin.map_or(0, |(row, _)| row.saturating_sub(1).min(rows)),
+        screen_clear: vte::Parser::new(),
+        screen_alternate: false,
         insertion_transport: InsertionTransport::for_shell(&shell),
         fish_shell: shell_name(&shell) == "fish" || is_powershell(&shell),
         report_key: is_powershell(&shell),
@@ -440,6 +442,7 @@ pub fn run(shell: PathBuf, login: bool) -> Result<i32> {
         unconfirmed: String::new(),
         unconfirmed_at: Instant::now(),
         fish_refresh: None,
+        prompt_top: None,
         prompt_end: None,
         shell_nav: false,
         cwd_fallback: std::env::current_dir().unwrap_or_else(|_| "/".into()),
@@ -527,7 +530,13 @@ fn spawn_stdin_reader(tx: Sender<Event>) {
                     }
                 }
                 _ => {
-                    let _ = tx.send(Event::Exit);
+                    // The terminal went away while the child still owns its PTY.
+                    // Shut down the child before waiting for its exit.
+                    #[cfg(unix)]
+                    let event = Event::Shutdown(libc::SIGHUP);
+                    #[cfg(not(unix))]
+                    let event = Event::Exit;
+                    let _ = tx.send(event);
                     break;
                 }
             }
@@ -753,6 +762,28 @@ struct PromptEnd {
     prefix: String,
 }
 
+struct ScreenClear {
+    alternate: bool,
+    normal_erased: bool,
+}
+
+impl vte::Perform for ScreenClear {
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], ignore: bool, action: char) {
+        if ignore {
+            return;
+        }
+        match (intermediates, action) {
+            ([], 'J') if !self.alternate && params.len() == 1 && params.iter().next() == Some(&[2]) => {
+                self.normal_erased = true;
+            }
+            ([b'?'], 'h' | 'l') if params.iter().any(|arg| matches!(arg, [47] | [1047] | [1049])) => {
+                self.alternate = action == 'h'
+            }
+            _ => {}
+        }
+    }
+}
+
 struct PendingSnapshot {
     id: u64,
     deadline: Instant,
@@ -819,6 +850,8 @@ struct Session {
     fish_sequence: u64,
     /// Rows above the startup cursor are absent from the screen model.
     unknown_rows: u16,
+    screen_clear: vte::Parser,
+    screen_alternate: bool,
     insertion_transport: InsertionTransport,
     /// The shell reports its line when asked, as fish does; PowerShell speaks the same
     /// protocol (see shell/lig.ps1).
@@ -845,6 +878,8 @@ struct Session {
     /// When text was last added to `unconfirmed`: older text is let go (see [`ENTER_WAIT`]).
     unconfirmed_at: Instant,
     fish_refresh: Option<FishRefresh>,
+    /// First row of the active prompt, when the shell announced it.
+    prompt_top: Option<u16>,
     cfg: Config,
     preview: Option<previews::State>,
     /// The line the shell was last asked about (see [`ZSH_COMPLETE_KEY`]).
@@ -1302,7 +1337,7 @@ impl Session {
             let next_msg = msgs.peek().map(|&(pos, _)| pos);
             let Some(pos) = next_msg.into_iter().chain(marks.peek().copied()).min() else { break };
             w.extend_from_slice(&fwd[at..pos]);
-            self.process_preview_output(&fwd[at..pos]);
+            self.process_terminal_output(&fwd[at..pos]);
             at = pos;
             if next_msg == Some(pos) {
                 let (_, m) = msgs.next().unwrap();
@@ -1313,16 +1348,14 @@ impl Session {
                 // The terminal starts a new line at a prompt mark; do it here so vt100 does too.
                 if self.parser.screen().cursor_position().1 != 0 {
                     w.extend_from_slice(b"\r\n");
-                    self.process_preview_output(b"\r\n");
+                    self.process_terminal_output(b"\r\n");
                 }
-                if let Some(preview) = &mut self.preview {
-                    preview.mark_prompt(self.parser.screen_mut());
-                }
+                self.mark_prompt();
             }
         }
         w.extend_from_slice(&fwd[at..]);
         self.write_out(&w);
-        self.process_preview_output(&fwd[at..]);
+        self.process_terminal_output(&fwd[at..]);
         if before.is_some_and(|b| b != self.screen_state())
             && let Some(refresh) = &mut self.fish_refresh
         {
@@ -1434,8 +1467,9 @@ impl Session {
     }
 
     fn reset_line(&mut self) {
+        self.prompt_top = None;
         if let Some(preview) = &mut self.preview {
-            preview.reset_prompt();
+            preview.input_tail.clear();
         }
         self.editing = false;
         self.foreign = false;
@@ -1604,8 +1638,9 @@ impl Session {
             }
             Msg::Finish => {
                 crate::log("reader finished");
+                self.prompt_top = None;
                 if let Some(preview) = &mut self.preview {
-                    preview.reset_prompt();
+                    preview.input_tail.clear();
                 }
                 self.history_mode = false;
                 self.fish_refresh = None;
@@ -1629,9 +1664,7 @@ impl Session {
             }
             Msg::Path(p) => self.env.path = Some(p),
             Msg::Cwd(c) => {
-                if let Some(preview) = &mut self.preview {
-                    preview.mark_prompt(self.parser.screen_mut());
-                }
+                self.mark_prompt();
                 // Follow the shell's cwd so hosts reading ours from `/proc` inherit it.
                 if self.remote.is_none() {
                     let _ = std::env::set_current_dir(&c);
@@ -1910,6 +1943,7 @@ impl Session {
                 Some(Action::Next) => {
                     self.navigated = true;
                     self.selected = (self.selected + 1) % self.items.len();
+                    self.preview_selection_changed();
                     redraw = true;
                 }
                 Some(Action::Prev) if self.selected == 0 => {
@@ -1920,6 +1954,7 @@ impl Session {
                 Some(Action::Prev) => {
                     self.navigated = true;
                     self.selected -= 1;
+                    self.preview_selection_changed();
                     redraw = true;
                 }
                 Some(Action::History | Action::FolderHistory) => {
@@ -2371,13 +2406,19 @@ impl Session {
         if let Some(prompt) = &mut self.prompt_end {
             prompt.row = (i32::from(prompt.row) - shift).clamp(0, i32::from(rows) - 1) as u16;
         }
-        self.preview_shift(shift, rows, cols != old_cols);
+        self.prompt_top = self
+            .prompt_top
+            .filter(|_| cols == old_cols)
+            .map(|row| (i32::from(row) - shift).clamp(0, i32::from(rows) - 1) as u16);
+        self.preview_shift(shift, rows);
         self.drawn = self.drawn.and_then(|rect| shifted(rect, shift, rows));
         self.shown = self.shown.and_then(|rect| shifted(rect, shift, rows));
         if shift < 0 || cols != old_cols {
             // Rows above came back from the terminal's scrollback or were rewrapped: unknown now
             // (`known_from` keeps this to the rows above the cursor).
             self.unknown_rows = u16::MAX;
+            self.screen_clear = vte::Parser::new();
+            self.screen_alternate = self.parser.screen().alternate_screen();
         }
         self.mark_dirty();
         if !r.held.is_empty() {
@@ -2389,6 +2430,46 @@ impl Session {
     }
 
     // ------------------------------------------------------------ drawing
+
+    fn mark_prompt(&mut self) {
+        let screen = self.parser.screen();
+        if !screen.alternate_screen() {
+            self.prompt_top = Some(screen.cursor_position().0);
+        }
+    }
+
+    fn process_terminal_output(&mut self, bytes: &[u8]) {
+        if self.unknown_rows != 0 {
+            let mut clear = ScreenClear {
+                alternate: self.screen_alternate || self.parser.screen().alternate_screen(),
+                normal_erased: false,
+            };
+            self.screen_clear.advance(&mut clear, bytes);
+            self.screen_alternate = clear.alternate;
+            if clear.normal_erased {
+                self.unknown_rows = 0;
+            }
+        }
+        if self.prompt_top.is_none() {
+            self.parser.process(bytes);
+            return;
+        }
+        // Anchor the vt100 view to detect new lines entering scrollback even when full.
+        let screen = self.parser.screen_mut();
+        screen.set_scrollback(1);
+        let base = screen.scrollback();
+        self.parser.process(bytes);
+        let screen = self.parser.screen_mut();
+        if base == 0 {
+            screen.set_scrollback(usize::MAX);
+        }
+        let after = screen.scrollback();
+        screen.set_scrollback(0);
+        self.prompt_top = after.checked_sub(base).filter(|_| !screen.alternate_screen()).and_then(|scroll| {
+            let row = self.prompt_top?;
+            Some(row.saturating_sub(scroll.min(usize::from(u16::MAX)) as u16))
+        });
+    }
 
     fn known_from(&mut self) -> u16 {
         let screen = self.parser.screen_mut();
@@ -2404,7 +2485,7 @@ impl Session {
         self.unknown_rows.saturating_sub(scrolled)
     }
 
-    fn popup_layout(&self, shown: &[Suggestion]) -> Option<popup::Layout> {
+    fn popup_layout(&self, shown: &[Suggestion], known_from: u16) -> Option<popup::Layout> {
         if shown.is_empty() {
             None
         } else {
@@ -2420,7 +2501,18 @@ impl Session {
             while top > 0 && screen.row_wrapped(top - 1) {
                 top -= 1;
             }
-            popup::layout_at(&self.cfg.ui, shown, screen.size(), screen.cursor_position(), top, tail.width() as u16)
+            if let Some(prompt_top) = self.prompt_top {
+                top = top.min(prompt_top);
+            }
+            popup::layout_at(
+                &self.cfg.ui,
+                shown,
+                screen.size(),
+                screen.cursor_position(),
+                top,
+                known_from,
+                tail.width().min(usize::from(u16::MAX)) as u16,
+            )
         }
     }
 
@@ -2469,7 +2561,7 @@ impl Session {
         if !stuck.is_empty() {
             self.erase(&mut w);
             w.extend_from_slice(&stuck);
-            self.process_preview_output(&stuck);
+            self.process_terminal_output(&stuck);
         }
         let fresh = self.visible();
         if fresh {
@@ -2497,38 +2589,14 @@ impl Session {
         });
         let is_message = message.is_some();
         let shown: Vec<Suggestion> = if fresh || keep { self.items.clone() } else { message.into_iter().collect() };
-        let mut layout = self.popup_layout(&shown);
         let known_from = self.known_from();
-        if let Some(l) = &layout
-            && l.rect.row < known_from
-        {
-            let (rows, _) = self.parser.screen().size();
-            let (row, col) = self.parser.screen().cursor_position();
-            let scroll = l.rect.height.saturating_sub(rows - row - 1).min(row);
-            if scroll > 0 {
-                self.erase(&mut w);
-                self.begin_sync(&mut w);
-                // Make blank space below the prompt without overwriting older output.
-                let bytes =
-                    format!("\x1b[{rows};1H{}\x1b[{};{}H", "\n".repeat(usize::from(scroll)), row + 1 - scroll, col + 1);
-                w.extend_from_slice(bytes.as_bytes());
-                self.process_preview_output(bytes.as_bytes());
-                if let Some(prompt) = &mut self.prompt_end {
-                    prompt.row = prompt.row.saturating_sub(scroll);
-                }
-                layout = self.popup_layout(&shown);
-            }
-            if layout.as_ref().is_some_and(|l| l.rect.row < self.known_from()) {
-                layout = None;
-            }
-        }
+        let mut layout = self.popup_layout(&shown, known_from);
         // Kept suggestions stay put: their anchor (`delete`) is for the old line.
         if keep && let (Some(l), Some(old)) = (layout.as_mut(), self.shown) {
             l.rect.col = old.col.min(self.parser.screen().size().1.saturating_sub(l.rect.width));
         }
         if self.preview.is_some() {
-            let known = self.known_from();
-            self.sync_preview(&mut layout, &shown, fresh && !is_message, known);
+            self.sync_preview(&mut layout, &shown, fresh && !is_message, known_from);
         }
         if std::env::var_os("LIG_LOG").is_some() {
             crate::log(&format!(
@@ -2574,6 +2642,18 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_real_full_clear_of_the_normal_screen_makes_its_rows_known() {
+        let mut tracker = ScreenClear { alternate: false, normal_erased: false };
+        let mut parser = vte::Parser::new();
+        parser.advance(&mut tracker, b"\x1b[?1049h\x1b[2J\x1b[?1049l\x1b[0J\x1b[?2J");
+        assert!(!tracker.normal_erased);
+        parser.advance(&mut tracker, b"\x1b[2");
+        assert!(!tracker.normal_erased);
+        parser.advance(&mut tracker, b"J\x1b[37;1H");
+        assert!(tracker.normal_erased);
+    }
 
     #[test]
     fn fish_refresh_rejects_stale_replies_and_stays_idle_after_ack() {

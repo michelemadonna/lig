@@ -50,6 +50,7 @@ pub struct Request {
 pub struct Document {
     pub(crate) content: Content,
     text_width: u16,
+    pub(crate) file_text: bool,
     pub(crate) git_diff: Option<git::Diff>,
 }
 
@@ -62,7 +63,7 @@ impl Document {
             }
             _ => 0,
         };
-        Self { content, text_width, git_diff: None }
+        Self { content, text_width, file_text: false, git_diff: None }
     }
 
     pub(crate) fn image_size(&self) -> Option<(u32, u32)> {
@@ -233,12 +234,12 @@ impl Drop for Worker {
 
 fn load(request: &Request, config: &Config, cache: &mut Cache, cancelled: &dyn Fn() -> bool) -> Arc<Document> {
     let path = &request.path;
-    let plain = |text| Arc::new(Document::new(Content::Text(content::Text::plain(text, config.max_lines))));
+    let plain = |text| Arc::new(Document::new(Content::Text(content::Text::plain(text, config.text.max_lines))));
 
     let ext = native::extension(path);
     if let Some(mode) = request.git
         && native::engine(config, &ext, native::Category::Text).backend == Backend::Native
-        && let Some((text, format)) = git::preview(mode, request, config, cancelled)
+        && let Some((text, format)) = git::preview(mode, request, config, config.text.max_lines, cancelled)
     {
         let mut doc = Document::new(Content::Text(text));
         doc.git_diff = format;
@@ -252,7 +253,7 @@ fn load(request: &Request, config: &Config, cache: &mut Cache, cancelled: &dyn F
         return Arc::new(Document::new(native::metadata(
             &meta,
             "Preview unavailable for this filesystem object",
-            config.max_lines,
+            config.text.max_lines,
             request.date_locale.as_deref(),
         )));
     }
@@ -271,6 +272,7 @@ fn load(request: &Request, config: &Config, cache: &mut Cache, cancelled: &dyn F
     }
     let category = native::category(&ext, &header, meta.is_dir());
     let engine = native::engine(config, &ext, category);
+    let max_lines = engine.max_lines;
     let is_external = engine.backend != Backend::Native;
     let cache_key = if is_external { external_key } else { native_key };
     if cancelled() {
@@ -284,7 +286,7 @@ fn load(request: &Request, config: &Config, cache: &mut Cache, cancelled: &dyn F
             width: request.viewport.0,
             height: request.viewport.1,
             extension: &ext,
-            max_lines: config.max_lines,
+            max_lines,
         };
         let result = external::command(engine, &args)
             .and_then(|command| {
@@ -292,17 +294,17 @@ fn load(request: &Request, config: &Config, cache: &mut Cache, cancelled: &dyn F
             })
             .and_then(|bytes| {
                 match engine.output {
-                    Output::Plain | Output::Ansi => {
-                        content::external(&bytes, config.max_lines, engine.output == Output::Ansi)
-                    }
-                    Output::MediainfoJson => media::from_mediainfo(&bytes, meta.len(), config.max_lines),
-                    Output::SevenZipList => archive::from_seven_zip(&bytes, config.max_lines),
+                    Output::Plain | Output::Ansi => content::external(&bytes, max_lines, engine.output == Output::Ansi),
+                    Output::MediainfoJson => media::from_mediainfo(&bytes, meta.len(), max_lines),
+                    Output::SevenZipList => archive::from_seven_zip(&bytes, max_lines),
                 }
                 .ok_or_else(|| anyhow::anyhow!("no usable preview output"))
             });
         match result {
             Ok(text) => {
-                let result = Arc::new(Document::new(Content::Text(text)));
+                let mut doc = Document::new(Content::Text(text));
+                doc.file_text = category == native::Category::Text;
+                let result = Arc::new(doc);
                 if !cancelled()
                     && let Some(key) = cache_key
                 {
@@ -315,21 +317,28 @@ fn load(request: &Request, config: &Config, cache: &mut Cache, cancelled: &dyn F
         }
     }
 
+    let mut file_text = false;
     let content = if is_external && engine.fallback == Fallback::Metadata {
-        native::metadata(&meta, "External preview unavailable", config.max_lines, request.date_locale.as_deref())
+        native::metadata(&meta, "External preview unavailable", max_lines, request.date_locale.as_deref())
     } else {
-        let opts = native::Options { config, light: request.light, show_hidden: request.show_hidden, cancelled };
+        let opts =
+            native::Options { config, engine, light: request.light, show_hidden: request.show_hidden, cancelled };
         match category.preview(path, file, &header, &opts) {
-            Ok(content) => content,
+            Ok(content) => {
+                file_text = category == native::Category::Text;
+                content
+            }
             Err(err) => {
                 if !cancelled() {
                     crate::log(&format!("native preview unavailable: {err}"));
                 }
-                native::metadata(&meta, "Content unavailable", config.max_lines, request.date_locale.as_deref())
+                native::metadata(&meta, "Content unavailable", max_lines, request.date_locale.as_deref())
             }
         }
     };
-    let result = Arc::new(Document::new(content));
+    let mut doc = Document::new(content);
+    doc.file_text = file_text;
+    let result = Arc::new(doc);
     if !cancelled()
         && let Some(key) = cache_key
     {

@@ -97,8 +97,11 @@ fn basic(code: u8) -> u8 {
     u8::from(code / 36 >= 3) + 2 * u8::from(code / 6 % 6 >= 3) + 4 * u8::from(code % 6 >= 3)
 }
 
-fn style(out: &mut Vec<u8>, colors: Colors, t: &Theme, s: Style) {
+fn style(out: &mut Vec<u8>, colors: Colors, t: &Theme, s: Style, dim: bool) {
     let _ = write!(out, "\x1b[0;{};{}", t.bg, t.fg);
+    if dim {
+        out.extend_from_slice(b";2");
+    }
     for (on, sgr) in [(s.bold, 1), (s.faint, 2), (s.italic, 3), (s.underline, 4), (s.inverse, 7), (s.strike, 9)] {
         if on {
             let _ = write!(out, ";{sgr}");
@@ -172,7 +175,7 @@ pub fn draw(
     scroll: usize,
     options: Options,
 ) {
-    let Options { colors, image } = options;
+    let Options { colors, image, title_icon, loading_frame, animation } = options;
     let t = theme::resolve(ui);
     let frame = placement.frame;
     let r = placement.content();
@@ -183,10 +186,22 @@ pub fn draw(
         if ui.border == "rounded" { ("╭", "╮", "╰", "╯") } else { ("┌", "┐", "└", "┘") };
     if framed {
         let title = title.trim_start_matches(|c: char| c.is_control() || c == '\u{200b}');
-        let (title, title_width) = clip(title, w.saturating_sub(3), 0);
-        let fill = "─".repeat(w.saturating_sub(if title.is_empty() { 0 } else { title_width + 2 }));
-        let title = if title.is_empty() { String::new() } else { format!(" {title} ") };
-        let _ = write!(out, "\x1b[{};{}H{edge}{tl}{title}{fill}{tr}\x1b[0m", frame.row + 1, frame.col + 1);
+        let (glyph, glyph_color, glyph_width) = title_icon.map_or((String::new(), "", 0), |(glyph, color)| {
+            let (glyph, width) = clip(&glyph, w.saturating_sub(3), 0);
+            (glyph.to_owned(), color, width)
+        });
+        let icon_width = usize::from(glyph_width > 0) * (glyph_width + 1);
+        let (title, title_width) = clip(title, w.saturating_sub(icon_width + 3), 0);
+        let total = icon_width + title_width;
+        let fill = "─".repeat(w.saturating_sub(if total == 0 { 0 } else { total + 2 }));
+        let _ = write!(out, "\x1b[{};{}H{edge}{tl}", frame.row + 1, frame.col + 1);
+        if glyph_width > 0 {
+            let _ = write!(out, " \x1b[{glyph_color}m{glyph}\x1b[0;{};{}m", t.bg, t.fg);
+        }
+        if !title.is_empty() {
+            let _ = write!(out, " {title} ");
+        }
+        let _ = write!(out, "{fill}{tr}\x1b[0m");
     }
     let mosaic = match (document, image) {
         (Some(Content::Image(raster)), Some((style @ (ImageStyle::Quadrants | ImageStyle::HalfBlocks), (w, h)))) => {
@@ -195,24 +210,41 @@ pub fn draw(
         _ => None,
     };
     let h = usize::from(r.height);
+    let reveal_rows =
+        animation.map_or(
+            h,
+            |(effect, step)| {
+                if effect == super::config::Animation::Reveal { h * usize::from(step) / 4 } else { h }
+            },
+        );
+    let fade = animation.is_some_and(|(effect, step)| effect == super::config::Animation::Fade && step < 2);
     for row in 0..h {
         let _ = write!(out, "\x1b[{};{}H", usize::from(r.row) + row + 1, frame.col + 1);
         if framed {
             let _ = write!(out, "{edge}│");
         }
         let _ = write!(out, "\x1b[0;{};{}m", t.bg, t.fg);
-        let used = match document {
-            Some(Content::Text(doc)) => text_row(out, doc, scroll + row, w, &t, colors),
-            Some(Content::Image(_)) => {
-                mosaic.as_ref().map_or(0, |(pixels, style)| image_row(out, pixels, row as u32, &t, colors, *style))
+        if fade {
+            out.extend_from_slice(b"\x1b[2m");
+        }
+        let used = if row >= reveal_rows {
+            0
+        } else {
+            match document {
+                Some(Content::Text(doc)) => text_row(out, doc, scroll + row, w, &t, colors, fade),
+                Some(Content::Image(_)) => {
+                    mosaic.as_ref().map_or(0, |(pixels, style)| image_row(out, pixels, row as u32, &t, colors, *style))
+                }
+                Some(Content::Directory(rows)) => rows.get(scroll + row).map_or(0, |row| tree_row(out, ui, row, w, &t)),
+                None if row == 0 => {
+                    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                    let label = format!("{} Loading preview…", SPINNER[usize::from(loading_frame) % SPINNER.len()]);
+                    let (label, used) = clip(&label, w, 0);
+                    out.extend_from_slice(label.as_bytes());
+                    used
+                }
+                None => 0,
             }
-            Some(Content::Directory(rows)) => rows.get(scroll + row).map_or(0, |row| tree_row(out, ui, row, w, &t)),
-            None if row == 0 => {
-                let (label, used) = clip("Loading preview…", w, 0);
-                out.extend_from_slice(label.as_bytes());
-                used
-            }
-            None => 0,
         };
         let _ = write!(out, "\x1b[0;{}m{}", t.bg, " ".repeat(w - used));
         if framed {
@@ -256,6 +288,9 @@ impl ImageStyle {
 pub struct Options {
     pub colors: Colors,
     pub image: Option<(ImageStyle, (u32, u32))>,
+    pub title_icon: Option<(String, &'static str)>,
+    pub loading_frame: u8,
+    pub animation: Option<(super::config::Animation, u8)>,
 }
 
 fn tree_icon(ui: &Ui, row: &TreeRow, width: usize) -> Option<(String, &'static str, usize)> {
@@ -288,7 +323,7 @@ fn tree_row(out: &mut Vec<u8>, ui: &Ui, row: &TreeRow, width: usize, theme: &The
     used + cells
 }
 
-fn text_row(out: &mut Vec<u8>, doc: &Text, line: usize, width: usize, t: &Theme, colors: Colors) -> usize {
+fn text_row(out: &mut Vec<u8>, doc: &Text, line: usize, width: usize, t: &Theme, colors: Colors, dim: bool) -> usize {
     let Some(spans) = doc.lines.get(line) else { return 0 };
     let mut used = 0;
     let number_width = digits(doc.lines.len());
@@ -301,7 +336,7 @@ fn text_row(out: &mut Vec<u8>, doc: &Text, line: usize, width: usize, t: &Theme,
         let source = span_start(&span.text, used == start);
         let (text, count) = clip(source, width, used);
         if !text.is_empty() {
-            style(out, colors, t, span.style);
+            style(out, colors, t, span.style, dim);
             out.extend_from_slice(text.as_bytes());
         }
         used += count;
@@ -408,7 +443,7 @@ fn image_row(out: &mut Vec<u8>, img: &RgbaImage, row: u32, t: &Theme, colors: Co
         };
         let (fg, bg) = (color(top), color(bottom));
         if prev != Some((fg, bg)) {
-            style(out, colors, t, Style { fg, bg, ..Style::default() });
+            style(out, colors, t, Style { fg, bg, ..Style::default() }, false);
             prev = Some((fg, bg));
         }
         out.extend_from_slice(glyph.encode_utf8(&mut [0; 4]).as_bytes());
@@ -418,7 +453,7 @@ fn image_row(out: &mut Vec<u8>, img: &RgbaImage, row: u32, t: &Theme, colors: Co
 
 #[cfg(test)]
 mod tests {
-    use super::super::{config::Position, content::Text};
+    use super::super::{content::Text, layout::Position};
     use super::*;
     use crate::{config::Ui, popup::Rect};
 
@@ -439,7 +474,7 @@ mod tests {
             Some(&content),
             "file",
             0,
-            Options { colors: Colors::Rgb, image: None },
+            Options { colors: Colors::Rgb, image: None, title_icon: None, loading_frame: 0, animation: None },
         );
         let mut screen = vt100::Parser::new(8, 20, 0);
         screen.process(b"protected");
@@ -456,5 +491,64 @@ mod tests {
         assert_eq!(quadrants([light, dark, light, dark]), ('▌', light, dark));
         assert_eq!(quadrants([dark, light, light, dark]), ('▞', light, dark));
         assert_eq!(super::super::raster::fit_cells((200, 100), (8, 16), (20, 10), (2, 2)), (40, 10));
+    }
+
+    #[test]
+    fn title_icon_and_loading_spinner_are_rendered() {
+        let mut bytes = Vec::new();
+        let placement = Placement {
+            frame: Rect { row: 0, col: 0, height: 4, width: 20 },
+            position: Position::Right,
+            inline: true,
+            preferred: None,
+        };
+        draw(
+            &mut bytes,
+            &Ui::default(),
+            placement,
+            None,
+            "file.rs",
+            0,
+            Options {
+                colors: Colors::Rgb,
+                image: None,
+                title_icon: Some(("◆".into(), "38;5;75")),
+                loading_frame: 2,
+                animation: None,
+            },
+        );
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(output.contains("◆"));
+        assert!(output.contains("file.rs"));
+        assert!(output.contains("Loading preview"));
+        assert!(output.contains("⠹"));
+    }
+
+    #[test]
+    fn reveal_starts_with_blank_content_and_completes_after_four_steps() {
+        let mut bytes = Vec::new();
+        let placement = Placement {
+            frame: Rect { row: 0, col: 0, height: 4, width: 20 },
+            position: Position::Right,
+            inline: true,
+            preferred: None,
+        };
+        let content = Content::Text(Text::plain("visible", 1));
+        draw(
+            &mut bytes,
+            &Ui::default(),
+            placement,
+            Some(&content),
+            "file",
+            0,
+            Options {
+                colors: Colors::Rgb,
+                image: None,
+                title_icon: None,
+                loading_frame: 0,
+                animation: Some((super::super::config::Animation::Reveal, 0)),
+            },
+        );
+        assert!(!String::from_utf8(bytes).unwrap().contains("visible"));
     }
 }

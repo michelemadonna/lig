@@ -24,14 +24,11 @@ pub enum ImageProtocol {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Position {
+pub enum ShowOn {
     #[default]
-    Auto,
-    Right,
-    Left,
-    Above,
-    #[serde(alias = "bottom")]
-    Below,
+    Always,
+    KeyToggle,
+    OnHover,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -53,6 +50,15 @@ pub enum Fallback {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum Animation {
+    #[default]
+    None,
+    Fade,
+    Reveal,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Output {
     Plain,
     MediainfoJson,
@@ -61,7 +67,7 @@ pub enum Output {
     Ansi,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Engine {
     pub backend: Backend,
@@ -73,6 +79,30 @@ pub struct Engine {
     pub script: Option<String>,
     pub fallback: Fallback,
     pub output: Output,
+    pub max_lines: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_numbers: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syntax_highlighting: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_protocol: Option<ImageProtocol>,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self {
+            backend: Backend::default(),
+            command: Vec::new(),
+            interpreter: None,
+            script: None,
+            fallback: Fallback::default(),
+            output: Output::default(),
+            max_lines: 200,
+            line_numbers: None,
+            syntax_highlighting: None,
+            image_protocol: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -114,22 +144,28 @@ impl Default for Keys {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub enabled: bool,
-    pub start_hidden: bool,
+    pub show_on: ShowOn,
+    /// Delay before showing an unchanged selection in `on_hover` mode.
+    pub on_hover_open_delay: u64,
+    /// Visual transition when a preview becomes visible.
+    pub animation: Animation,
+    /// Duration of preview entrance transitions in milliseconds; 0 disables animation.
+    pub animation_duration_ms: u64,
     pub layout: Layout,
-    pub position: Position,
     pub width: Size,
     pub height: Size,
+    pub max_width: Size,
+    pub max_height: Size,
     pub min_width: u16,
     pub min_height: u16,
+    /// Distance between floating previews and the terminal edge, in cells.
+    pub screen_margin: u16,
     pub margin: u16,
     pub adaptive_size: bool,
-    pub max_lines: usize,
     pub scroll_step: usize,
     pub max_bytes: usize,
     pub timeout_ms: u64,
     pub cache_entries: usize,
-    pub line_numbers: bool,
-    pub syntax_highlighting: bool,
     #[serde(rename = "preserve_completion", skip_serializing)]
     pub(super) legacy_preserve_completion: bool,
     pub preserve_prompt: bool,
@@ -138,7 +174,6 @@ pub struct Config {
     #[serde(rename = "show_controls", skip_serializing)]
     pub(super) legacy_show_controls: bool,
     pub keys: Keys,
-    pub image_protocol: ImageProtocol,
     pub text: Engine,
     pub image: Engine,
     pub archive: Engine,
@@ -151,29 +186,30 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: false,
-            start_hidden: false,
+            show_on: ShowOn::Always,
+            on_hover_open_delay: 500,
+            animation: Animation::None,
+            animation_duration_ms: 300,
             layout: Layout::Auto,
-            position: Position::Auto,
             width: Size::Text("40%".into()),
             height: Size::Text("60%".into()),
+            max_width: Size::Text("auto".into()),
+            max_height: Size::Text("auto".into()),
             min_width: 28,
             min_height: 5,
+            screen_margin: 10,
             margin: 1,
             adaptive_size: true,
-            max_lines: 200,
             scroll_step: 3,
             max_bytes: 262_144,
             timeout_ms: 2000,
             cache_entries: 16,
-            line_numbers: true,
-            syntax_highlighting: true,
             legacy_preserve_completion: true,
             preserve_prompt: true,
             mouse: true,
             show_title: true,
             legacy_show_controls: true,
             keys: Keys::default(),
-            image_protocol: ImageProtocol::Auto,
             text: Engine::default(),
             image: Engine::default(),
             archive: Engine::default(),
@@ -189,26 +225,83 @@ impl Config {
         for (name, value) in [("width", &self.width), ("height", &self.height)] {
             let valid = match value {
                 Size::Cells(n) => *n > 0,
-                Size::Text(s) if s == "auto" => true,
-                Size::Text(s) => {
-                    s.strip_suffix('%').and_then(|n| n.parse::<f32>().ok()).is_some_and(|n| n > 0.0 && n <= 100.0)
-                }
+                Size::Text(s) => s
+                    .trim()
+                    .strip_suffix('%')
+                    .and_then(|n| n.parse::<f32>().ok())
+                    .is_some_and(|n| n > 0.0 && n <= 100.0),
+            };
+            if !valid {
+                return Err(format!("preview.{name} must be positive cells or 1–100%"));
+            }
+        }
+        for (name, value) in [("max_width", &self.max_width), ("max_height", &self.max_height)] {
+            let valid = match value {
+                Size::Cells(n) => *n > 0,
+                Size::Text(s) if s.trim() == "auto" => true,
+                Size::Text(s) => s
+                    .trim()
+                    .strip_suffix('%')
+                    .and_then(|n| n.parse::<f32>().ok())
+                    .is_some_and(|n| n > 0.0 && n <= 100.0),
             };
             if !valid {
                 return Err(format!("preview.{name} must be positive cells, 1–100%, or 'auto'"));
             }
         }
-        if !(4..=256).contains(&self.min_width) || !(3..=128).contains(&self.min_height) || self.margin > 40 {
-            return Err("preview requires min_width 4–256, min_height 3–128 and margin <= 40".into());
+        if !(4..=256).contains(&self.min_width)
+            || !(3..=128).contains(&self.min_height)
+            || self.margin > 40
+            || self.screen_margin > 40
+        {
+            return Err("preview requires min_width 4–256, min_height 3–128 and margins <= 40".into());
         }
-        if !(1..=4096).contains(&self.max_lines) || !(1..=1_048_576).contains(&self.max_bytes) {
-            return Err("preview.max_lines must be 1–4096 and max_bytes must be 1–1048576".into());
+        if !(1..=1_048_576).contains(&self.max_bytes) {
+            return Err("preview.max_bytes must be 1–1048576".into());
         }
         if !(1..=30_000).contains(&self.timeout_ms) || self.cache_entries > 64 {
             return Err("preview.timeout_ms must be 1–30000 and cache_entries must be 0–64".into());
         }
+        if self.on_hover_open_delay > 30_000 {
+            return Err("preview.on_hover_open_delay must be 0–30000".into());
+        }
+        if self.animation_duration_ms > 30_000 {
+            return Err("preview.animation_duration_ms must be 0–30000".into());
+        }
         if !(1..=128).contains(&self.scroll_step) {
             return Err("preview.scroll_step must be 1–128".into());
+        }
+        for (name, engine) in [
+            ("text", &self.text),
+            ("image", &self.image),
+            ("archive", &self.archive),
+            ("media", &self.media),
+            ("directory", &self.directory),
+        ] {
+            validate_engine(name, engine)?;
+        }
+        for (ext, engine) in &self.rules {
+            validate_engine(&format!("rules.{ext}"), engine)?;
+        }
+        for (name, engine) in
+            [("image", &self.image), ("archive", &self.archive), ("media", &self.media), ("directory", &self.directory)]
+        {
+            if engine.line_numbers.is_some() || engine.syntax_highlighting.is_some() {
+                return Err(format!("preview.{name} does not support text styling options"));
+            }
+        }
+        for (name, engine) in
+            [("text", &self.text), ("archive", &self.archive), ("media", &self.media), ("directory", &self.directory)]
+        {
+            if engine.image_protocol.is_some() {
+                return Err(format!("preview.{name}.image_protocol is only supported under preview.image"));
+            }
+        }
+        for (name, engine) in &self.rules {
+            if engine.line_numbers.is_some() || engine.syntax_highlighting.is_some() || engine.image_protocol.is_some()
+            {
+                return Err(format!("preview.rules.{name} does not support provider-specific display options"));
+            }
         }
         let mut keys = Vec::new();
         for (name, binding) in [
@@ -275,4 +368,11 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn validate_engine(name: &str, engine: &Engine) -> Result<(), String> {
+    if !(1..=4096).contains(&engine.max_lines) {
+        return Err(format!("preview.{name}.max_lines must be 1–4096"));
+    }
+    Ok(())
 }

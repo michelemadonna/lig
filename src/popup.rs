@@ -200,17 +200,17 @@ const MIN_DESC: u16 = 8;
 
 /// Where the popup goes for this screen/cursor, or `None` if it can't fit.
 pub fn layout(ui: &Ui, items: &[Suggestion], size: (u16, u16), cursor: (u16, u16), token_width: u16) -> Option<Layout> {
-    layout_at(ui, items, size, cursor, cursor.0, token_width)
+    layout_at(ui, items, size, cursor, cursor.0, 0, token_width)
 }
 
-/// Like [`layout`], for input that starts on row `input_top` (a command
-/// wrapping over several rows): placed above, the popup goes above all of it.
+/// Fit the popup outside the input and only on rows we can restore.
 pub fn layout_at(
     ui: &Ui,
     items: &[Suggestion],
     (rows, cols): (u16, u16),
     (crow, ccol): (u16, u16),
     input_top: u16,
+    known_from: u16,
     token_width: u16,
 ) -> Option<Layout> {
     if items.is_empty() || rows < 3 || cols < 12 {
@@ -229,6 +229,9 @@ pub fn layout_at(
     // Without a border the scrollbar takes its own column.
     let bar = 1 - b;
     let chrome_w = 2 * b + style.pad_l + style.pad_r + icon_w + bar;
+    if chrome_w >= cols {
+        return None;
+    }
     // Capped before the cast to u16: a longer one would wrap around.
     let name_need = items.iter().map(|s| s.label.width()).max().unwrap_or(1).clamp(4, 44) as u16;
     let bottom = ui.descriptions && ui.description_position == "bottom";
@@ -272,15 +275,20 @@ pub fn layout_at(
         frame_lines = needed.min(ui.description_lines);
     }
     let frame_h = frame_height(frame_lines, b);
-    let want = (items.len() as u16).min(max_items).max(ui.min_height.min(max_items)) + chrome_h + frame_h;
-    let below = rows.saturating_sub(crow + 1);
-    let above = input_top.min(crow);
+    let want = (items.len().min(usize::from(max_items)) as u16)
+        .max(ui.min_height.min(max_items))
+        .saturating_add(chrome_h)
+        .saturating_add(frame_h);
+    let below_start = crow.saturating_add(1).max(known_from);
+    let below = rows.saturating_sub(below_start);
+    let above_end = input_top.min(crow);
+    let above = above_end.saturating_sub(known_from);
     // Prefer below (shrinking, the list scrolls); flip above only when there's hardly any room.
     let (row, height) = if below >= want || below >= want.min(MIN_BELOW + chrome_h) || below >= above {
-        (crow + 1, want.min(below))
+        (below_start, want.min(below))
     } else {
         let h = want.min(above);
-        (above - h, h)
+        (above_end - h, h)
     };
     // Not even one suggestion row next to the frame: drop the frame.
     if height <= chrome_h + frame_h {
@@ -389,8 +397,9 @@ pub fn render(ui: &Ui, l: &Layout, items: &[Suggestion], selected: usize, scroll
     }
     if let Some(bd) = st.border {
         // Left out when it doesn't fit between the corners and one `─`.
-        let counter = Some(format!(" {}/{} ", selected + 1, n))
-            .filter(|c| n > h && selected < n && c.width() + 3 <= w)
+        let counter = (n > h && selected < n)
+            .then(|| format!(" {}/{} ", selected + 1, n))
+            .filter(|c| c.width() + 3 <= w)
             .unwrap_or_default();
         let fill = w.saturating_sub(2 + counter.width() + usize::from(!counter.is_empty()));
         let tail =
@@ -551,8 +560,29 @@ mod tests {
     #[test]
     fn above_a_wrapped_command() {
         let ui = Ui::default();
-        let r = layout_at(&ui, &items(20), (24, 80), (23, 4), 21, 0).unwrap().rect;
+        let r = layout_at(&ui, &items(20), (24, 80), (23, 4), 21, 0, 0).unwrap().rect;
         assert_eq!(r.row + r.height, 21);
+    }
+
+    #[test]
+    fn fit_only_in_restorable_rows() {
+        let ui = Ui::default();
+        let items = items(20);
+        let place = |cursor, top, known| layout_at(&ui, &items, (24, 80), (cursor, 4), top, known, 0);
+        let above = place(23, 22, 18).unwrap().rect;
+        assert_eq!((above.row, above.height), (18, 4));
+        let below = place(20, 19, 18).unwrap().rect;
+        assert_eq!((below.row, below.height), (21, 3));
+        assert!(place(23, 22, 20).is_none());
+    }
+
+    #[test]
+    fn loading_message_has_no_candidate_counter() {
+        let ui = Ui::default();
+        let items = items(1);
+        let layout = layout(&ui, &items, (24, 80), (2, 4), 0).unwrap();
+        let lines = render(&ui, &layout, &items, usize::MAX, 0);
+        assert!(!lines.last().unwrap().contains('/'));
     }
 
     #[test]

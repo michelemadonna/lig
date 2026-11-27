@@ -68,11 +68,23 @@ fn configuration_is_opt_in_validated_and_resolves_rules() {
         r#"
         [preview]
         enabled = true
+        show_on = "on_hover"
         layout = "floating"
         width = "50%"
+        max_width = "80%"
+        on_hover_open_delay = 450
+        animation = "reveal"
+        animation_duration_ms = 600
+        screen_margin = 8
         [preview.text]
+        max_lines = 120
+        line_numbers = false
+        syntax_highlighting = false
         backend = "shell"
         script = "printf '%s' \"$LIG_PREVIEW_FILE\""
+        [preview.image]
+        image_protocol = "half_blocks"
+        max_lines = 80
         [preview.rules.".JSON"]
         backend = "command"
         command = ["jq", ".", "{file}"]
@@ -81,6 +93,16 @@ fn configuration_is_opt_in_validated_and_resolves_rules() {
     .unwrap()
     .preview;
     assert_eq!(cfg.layout, config::Layout::Floating);
+    assert_eq!(cfg.show_on, config::ShowOn::OnHover);
+    assert_eq!(cfg.on_hover_open_delay, 450);
+    assert_eq!(cfg.animation, config::Animation::Reveal);
+    assert_eq!(cfg.animation_duration_ms, 600);
+    assert_eq!(cfg.screen_margin, 8);
+    assert_eq!(cfg.text.max_lines, 120);
+    assert_eq!(cfg.text.line_numbers, Some(false));
+    assert_eq!(cfg.text.syntax_highlighting, Some(false));
+    assert_eq!(cfg.image.image_protocol, Some(config::ImageProtocol::HalfBlocks));
+    assert_eq!(cfg.image.max_lines, 80);
     assert_eq!(cfg.width.resolve(120), Some(60));
     assert_eq!(native::engine(&cfg, "json", native::Category::Text).backend, Backend::Command);
     assert_eq!(native::engine(&cfg, "yaml", native::Category::Text).backend, Backend::Shell);
@@ -88,8 +110,21 @@ fn configuration_is_opt_in_validated_and_resolves_rules() {
     for table in [
         "[preview]\nwidth = '200%'",
         "[preview]\nheight = 'typo'",
+        "[preview]\nwidth = 'auto'",
+        "[preview]\nheight = 'auto'",
         "[preview]\nmax_bytes = 0",
+        "[preview]\nmax_lines = 2",
+        "[preview]\nposition = 'auto'",
+        "[preview]\nstart_hidden = true",
+        "[preview]\nauto_open_delay_ms = 10",
         "[preview]\nlayout = 'column'",
+        "[preview]\non_hover_open_delay = 30001",
+        "[preview.text]\nmax_lines = 5000",
+        "[preview.image]\nline_numbers = false",
+        "[preview.text]\nimage_protocol = 'cells'",
+        "[preview]\nanimation_duration_ms = 30001",
+        "[preview]\nscreen_margin = 41",
+        "[preview]\nanimation = 'slide'",
         "[preview]\nunknown = 1",
         "[preview.text]\nbackend = 'command'",
         "[preview.text]\nbackend = 'shell'",
@@ -150,7 +185,8 @@ fn native_text_preserves_source_and_applies_theme_and_bounds() {
     let dir = Fixture::new();
     let src = "pub fn demo() -> bool { true }\n// second\n// third";
     let source = request(dir.file("file.rs", src));
-    let mut config = Config { max_lines: 2, ..Config::default() };
+    let mut config = Config { ..Config::default() };
+    config.text.max_lines = 2;
     let dark = read(&source, &config);
     let Content::Text(doc) = &dark.content else { panic!("text expected") };
     assert_eq!(text(&dark), "pub fn demo() -> bool { true }\n// second");
@@ -162,8 +198,8 @@ fn native_text_preserves_source_and_applies_theme_and_bounds() {
     let Content::Text(light_doc) = &light.content else { panic!("text expected") };
     assert_ne!(light_doc.lines[0][0].style.fg, doc.lines[0][0].style.fg);
     config.max_bytes = 6;
-    config.line_numbers = false;
-    config.syntax_highlighting = false;
+    config.text.line_numbers = Some(false);
+    config.text.syntax_highlighting = Some(false);
     let limited = read(&source, &config);
     assert_eq!(text(&limited), "pub fn");
     let Content::Text(doc) = &limited.content else { panic!("text expected") };
@@ -232,7 +268,7 @@ fn archives_list_names_and_sizes_without_extracting() {
     zip_writer.finish().unwrap();
     let contents = text(&read(&request(zip.clone()), &Config::default()));
     assert!(contents.contains("nested/entry.txt   4 B") && contents.contains("2 entries"), "{contents}");
-    let limited = Config { max_lines: 2, ..Config::default() };
+    let limited = Config { archive: config::Engine { max_lines: 2, ..Config::default().archive }, ..Config::default() };
     assert!(text(&read(&request(zip), &limited)).contains("1 of 2 entries"));
 
     let mut writer = tar::Builder::new(Vec::new());
@@ -302,8 +338,8 @@ fn external_argv_and_shell_keep_unicode_and_metacharacters_as_data() {
     let cfg = crate::config::Config::parse(
         r#"
         [preview]
-        max_lines = 12
         [preview.text]
+        max_lines = 12
         backend = "command"
         command = ["printf", "%s\n", "file={file}", "{width}x{height}/{max_lines}:{extension}"]
         output = "plain"
@@ -485,6 +521,12 @@ fn preview_key_defaults_distinguish_visibility_layout_and_size() {
     let roundtrip = toml::to_string(&config).unwrap();
     assert!(!roundtrip.contains("show_controls") && !roundtrip.contains("preserve_completion"));
     assert!(crate::config::Config::parse("[preview.keys]\ntoggle_layout='alt-P'\nopen='shift-alt-p'").is_err());
+    let defaults = crate::config::Config::parse("").unwrap().preview;
+    assert_eq!(defaults.show_on, crate::preview::config::ShowOn::Always);
+    assert_eq!(defaults.on_hover_open_delay, 500);
+    assert_eq!(defaults.animation, crate::preview::config::Animation::None);
+    assert_eq!(defaults.animation_duration_ms, 300);
+    assert_eq!(defaults.screen_margin, 10);
 }
 
 #[test]
@@ -521,7 +563,7 @@ fn directory_tree_is_sorted_bounded_and_refreshes_nested_entries() {
         assert!(rows.iter().any(|row| row.name == "link" && row.directory));
         assert!(!rows.iter().any(|row| row.name == "from-link"));
 
-        config.max_lines = 2;
+        config.directory.max_lines = 2;
         assert_eq!(read(&request(dir.0.clone()), &config).content.lines(), 2);
     }
     let mut request = request(dir.0.clone());
@@ -567,7 +609,7 @@ fn localized_timestamp_is_first_in_generic_metadata() {
     File::options().write(true).open(&path).unwrap().set_modified(timestamp).unwrap();
     let mut request = request(path);
     request.date_locale = Some("C".into());
-    let config = Config { max_lines: 1, ..Config::default() };
+    let config = Config { text: config::Engine { max_lines: 1, ..Config::default().text }, ..Config::default() };
     let expected = locale::modified(timestamp, Some("C")).unwrap();
     assert_eq!(text(&read(&request, &config)), format!("Modified: {expected}"));
     assert!(locale::modified(timestamp, Some("not_an_installed_locale")).is_some());

@@ -12,15 +12,22 @@ Each example is a standalone configuration excerpt. Merge its tables into your e
 [preview]
 enabled = true
 layout = "auto"
-position = "auto"
 width = "40%"
 height = "60%"
+max_width = "auto"
+max_height = "auto"
 adaptive_size = true
+
+[preview.text]
+max_lines = 200
 line_numbers = true
 syntax_highlighting = true
+
+[preview.image]
+image_protocol = "auto"
 ```
 
-The native defaults show text, source code, images including WebP, archive entries and a directory tree up to three levels below the selected folder. The tree uses the same icons, icon overrides and hidden-file setting as the completion list. It shows symlinks without expanding their contents. When a preview cannot be generated, Lig shows file metadata with the modification date and time in the terminal locale. Contextual `git add`, `git diff` and `git restore` previews use Git when available and otherwise fall back to the file.
+The native defaults show text, source code, images including WebP, archive entries and a directory tree up to three levels below the selected folder. The preview title uses the completion list's file or folder icon, including custom `[icons]` overrides and the configured icon mode. The tree uses the same icons, icon overrides and hidden-file setting as the completion list. It shows symlinks without expanding their contents. Lig shows an animated spinner while the selected preview is loading. When a preview cannot be generated, Lig shows file metadata with the modification date and time in the terminal locale. Contextual `git add`, `git diff` and `git restore` previews use Git when available and otherwise fall back to the file.
 
 ### Archives and media
 
@@ -133,6 +140,8 @@ enabled = true
 layout = "floating"
 width = "45%"
 height = "60%"
+max_width = "auto"
+max_height = "auto"
 margin = 1
 ```
 
@@ -140,16 +149,20 @@ The floating panel chooses the side with more space above or below the active pr
 
 Inline and floating previews fit the width and height of the visible content by default. Images use the terminal cell proportions to keep their aspect ratio, including when a terminal image protocol is active. A long title is clipped to the frame.
 
-### Inline, starting hidden
+### Inline, opening on selection
 
 ```toml
 [preview]
 enabled = true
-start_hidden = true
+show_on = "on_hover"
+on_hover_open_delay = 500
+animation = "fade"
+animation_duration_ms = 300
 layout = "inline"
-position = "auto"
 width = "45%"
 height = "60%"
+max_width = "auto"
+max_height = "auto"
 
 [preview.keys]
 toggle = "alt-p"
@@ -161,37 +174,49 @@ page_up = "page-up"
 page_down = "page-down"
 ```
 
-An explicit inline pane sits flush beside the completion list. Lig narrows the list when necessary and uses the regular compact layout if the two panes cannot fit. With `layout = "auto"`, Lig can also choose a stacked or floating placement.
+An explicit inline pane sits flush beside the completion list. Lig narrows the list when necessary and uses the regular compact layout if the two panes cannot fit. With `layout = "auto"`, Lig can also choose a stacked or floating placement. The list and preview fit into the available terminal rows without scrolling the terminal.
 
 - **Alt+P** opens or hides the preview. Closing it restores the regular completion layout.
 - **Alt+F** switches between inline and floating for the session while keeping the current visibility.
-- **Alt+Z** switches a visible floating text, directory, archive, or metadata pane between its compact height and the maximum safe height. Its width still fits the content. Images have a separate cycle through the configured size, 66%, and 90%. Each image preset uses the space available when selected and recovers its size after temporary reductions.
+- **Alt+Z** switches a visible floating text-file preview between its compact size and the largest available rectangle, subject to the preview margins, `max_width`, and `max_height`. Directory, archive, and metadata previews expand in height. Images cycle through the configured size, 66%, and 90%.
 - **Alt+Z** also widens an expanded floating Git diff when there is room for at least 80 content columns and `delta` is available on the shell's `PATH`. Lig uses a unified diff in compact and inline panes and when a side-by-side diff is unavailable. Git and `delta` run with paging disabled for previews.
 
-`start_hidden` controls each popup's initial visibility. An empty key value disables that binding. Set `preview.keys.open` and `preview.keys.close` for dedicated bindings. Existing `[keys]` bindings and explicit preview shortcuts take precedence over the new defaults. Ctrl+P remains the default previous-candidate key.
+Zoom resets when the selection changes or the completion list closes. For the same selection, it survives terminal resizes and hiding and reopening the preview.
+
+`show_on` selects when the preview appears. `always` shows it for each selected file or folder; the toggle can hide it for the current selection, and the next selection shows it again. `key_toggle` starts hidden and shows only on an explicit open or toggle; closing it or changing selection hides it. `on_hover` starts a timer for each file or folder selection, shows the preview if the selection remains unchanged until `on_hover_open_delay`, and closes it when selection changes. A manual close suppresses reopening for that same selection. The default is `always`, with an `on_hover_open_delay` of `500` milliseconds. An empty key value disables that binding. Set `preview.keys.open` and `preview.keys.close` for dedicated bindings. Existing `[keys]` bindings and explicit preview shortcuts take precedence over the new defaults. Ctrl+P remains the default previous-candidate key.
+
+`animation` selects `none`, `fade`, or `reveal`; `none` is the default. `animation_duration_ms` sets the transition duration; `0` skips the transition. The transitions do not block input or completion work.
 
 ## Display and resource settings
 
 | Setting | Default | Behavior |
 |---|---|---|
-| `enabled`, `start_hidden` | `false`, `false` | Start previews only when enabled. Start an enabled popup hidden if requested. |
-| `layout`, `position` | `"auto"`, `"auto"` | Choose a layout and prefer `right`, `left`, `above` or `below` for inline placement. Explicit inline uses only side placements. Floating always uses the right-hand corners. |
-| `width`, `height` | `"40%"`, `"60%"` | Outer size in cells, percentage of the terminal, or `"auto"` for available space. Frames are capped at 256 columns and 128 rows. |
+| `enabled`, `show_on` | `false`, `"always"` | Enable previews and choose `always`, `key_toggle` or `on_hover` visibility. |
+| `on_hover_open_delay` | `500` | Wait this many milliseconds before showing a stable selection in `on_hover` mode. Maximum `30000`. |
+| `animation` | `"none"` | Preview entrance effect: `"none"`, `"fade"`, or `"reveal"`. |
+| `animation_duration_ms` | `300` | Duration of `fade` and `reveal` transitions in milliseconds; `0` skips the transition. Maximum `30000`. |
+| `layout` | `"auto"` | Choose automatic, inline or floating placement. Lig selects the position automatically; inline uses side placements first. |
+| `width`, `height` | `"40%"`, `"60%"` | Preferred outer size in cells or percentage of the terminal. `"auto"` is not accepted. |
+| `max_width`, `max_height` | `"auto"`, `"auto"` | Cap the outer size in cells or percentage of the terminal. `"auto"` uses all available space. Frames are capped at 256 columns and 128 rows. |
 | `min_width`, `min_height` | `28`, `5` | Minimum dimensions when finding inline space and preferred dimensions for floating placement. A fitted preview can draw a smaller frame. |
 | `margin` | `1` | Space between a floating pane and the list. |
+| `screen_margin` | `10` | Minimum distance in cells between a floating pane and each terminal edge. Maximum `40`; smaller terminals constrain the pane to the available area. |
 | `adaptive_size` | `true` | Fit the frame to native content and configured command output. Commands get the available viewport before fitting. Set to `false` to keep the allocated pane size. Floating images still fit the frame horizontally. |
 | `preserve_prompt` | `true` | Apply the configured margin between a floating pane and the prompt. Active prompt and input rows are always protected. |
 | `show_title` | `true` | Show the filename in the preview frame. |
 | `scroll_step` | `3` | Lines per wheel or line-scroll key. |
 | `mouse` | `true` | Scroll when the wheel is inside the visible preview. Terminals can require a modifier to select or use terminal scrollback while Lig owns mouse reporting. |
-| `max_lines`, `max_bytes` | `200`, `262144` | Bound displayed lines, the file prefix for native text, and stdout from configured commands. Stderr is discarded after counting up to 64 KiB. |
+| `[preview.text].max_lines` | `200` | Limit text preview rows. Other providers that render text can set their own `max_lines` under `[preview.image]`, `[preview.archive]`, `[preview.media]`, `[preview.directory]` or `[preview.rules.<extension>]`. |
+| `max_bytes` | `262144` | Bound the file prefix for native text and stdout from configured commands. Stderr is discarded after counting up to 64 KiB. |
 | `timeout_ms`, `cache_entries` | `2000`, `16` | External process deadline and the in-memory LRU entry cap. Cache storage is also limited to 16 MiB. |
-| `line_numbers`, `syntax_highlighting` | `true`, `true` | Native text styling. Very long lines and the tail of large files use plain text. |
-| `image_protocol` | `"auto"` | Detect Kitty or iTerm2. Set `"cells"` to force quadrants or `"half_blocks"` to use simpler glyphs with older fonts. |
+| `[preview.text].line_numbers`, `syntax_highlighting` | `true`, `true` | Native text styling. Very long lines and the tail of large files use plain text. |
+| `[preview.image].image_protocol` | `"auto"` | Detect Kitty or iTerm2. Set `"cells"` to force quadrants or `"half_blocks"` to use simpler glyphs with older fonts. |
 
 Lig accepts the legacy `preserve_completion` and `show_controls` settings for compatibility. Inline sizing is automatic and the popup has no preview key legend.
 
-`command` passes separate process arguments. `shell` runs the literal script from the user configuration through `sh`, PowerShell or an explicitly configured interpreter. POSIX-compatible interpreters receive `-c`. The two backends expose the same values.
+With `adaptive_size = true`, Lig fits the drawn frame to the rendered content, within the allocated size and `max_width`/`max_height`. With `false`, it keeps the allocated preview dimensions; image content still fits its frame while preserving its aspect ratio. Configured commands receive the available content viewport before Lig applies content fitting.
+
+`command` passes separate process arguments. `shell` runs the literal script from the user configuration through `sh`, PowerShell or an explicitly configured interpreter. POSIX-compatible interpreters receive `-c`. The two backends expose the same values; `{max_lines}` uses the selected provider's limit.
 
 | Argument placeholder | Environment variable |
 |---|---|

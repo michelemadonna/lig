@@ -2,7 +2,15 @@ use std::ops::Range;
 
 use crate::popup::Rect;
 
-use super::config::{Config, Layout, Position};
+use super::config::{Config, Layout};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    Right,
+    Left,
+    Above,
+    Below,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FloatingSize {
@@ -37,6 +45,7 @@ pub enum Floating {
     Tall {
         content_width: u16,
     },
+    ExpandedText,
     Wide,
     Image {
         preset: FloatingSize,
@@ -46,8 +55,12 @@ pub enum Floating {
 
 pub const MIN_DIFF_COLUMNS: u16 = 80;
 
-pub fn inline_sides(preferred: Position) -> [Position; 2] {
-    if preferred == Position::Left { [Position::Left, Position::Right] } else { [Position::Right, Position::Left] }
+fn screen_margins(config: &Config, (rows, cols): (u16, u16)) -> (u16, u16) {
+    (config.screen_margin.min(rows.saturating_sub(1) / 2), config.screen_margin.min(cols.saturating_sub(1) / 2))
+}
+
+pub fn inline_sides() -> [Position; 2] {
+    [Position::Right, Position::Left]
 }
 
 #[derive(Clone)]
@@ -126,12 +139,8 @@ pub fn place(
     }
 
     let automatic = [Position::Right, Position::Left, Position::Above, Position::Below];
-    let sides = inline_sides(config.position);
-    let positions = match (mode, &config.position) {
-        (Layout::Inline, _) => sides.as_slice(),
-        (_, Position::Auto) => automatic.as_slice(),
-        (_, position) => std::slice::from_ref(position),
-    };
+    let sides = inline_sides();
+    let positions = if mode == Layout::Inline { sides.as_slice() } else { automatic.as_slice() };
     let preferred = previous.filter(|p| p.inline && positions.contains(&p.position)).map(|p| p.position);
     let inline = preferred
         .into_iter()
@@ -141,31 +150,41 @@ pub fn place(
 }
 
 fn preferred_size(config: &Config, terminal: (u16, u16), available: (u16, u16), preset: FloatingSize) -> (u16, u16) {
-    let limit = |setting: &crate::config::Size, total, available, min, cap| {
-        preset
-            .percent()
-            .map_or_else(
-                || setting.resolve(total).unwrap_or(total),
-                |percent| ((u32::from(available) * percent + 50) / 100) as u16,
-            )
-            .clamp(min, cap)
+    let limit = |setting: &crate::config::Size,
+                 maximum: &crate::config::Size,
+                 total: u16,
+                 available: u16,
+                 min: u16,
+                 hard_cap: u16| {
+        let requested = preset.percent().map_or_else(
+            || setting.resolve(total).unwrap_or(total),
+            |percent| ((u32::from(available) * percent + 50) / 100) as u16,
+        );
+        let maximum = maximum.resolve(total).unwrap_or(total).min(available).min(hard_cap);
+        requested.min(maximum).max(min.min(maximum))
     };
-    let width = limit(&config.width, terminal.1, available.0, config.min_width, 256);
-    let height = limit(&config.height, terminal.0, available.1, config.min_height, 128);
+    let width = limit(&config.width, &config.max_width, terminal.1, available.0, config.min_width, 256);
+    let height = limit(&config.height, &config.max_height, terminal.0, available.1, config.min_height, 128);
     (width, height)
 }
 
 fn floating_space(config: &Config, context: &Context, known_from: u16, use_margin: bool) -> [(Position, u16, u16); 4] {
     let (rows, cols) = context.size;
     let list = context.completion;
+    let (screen_vertical, screen_horizontal) = screen_margins(config, context.size);
+    let screen_top = screen_vertical;
+    let screen_bottom = rows.saturating_sub(screen_vertical);
+    let screen_left = screen_horizontal;
+    let screen_right = cols.saturating_sub(screen_horizontal);
     let prompt_gap = if use_margin && config.preserve_prompt { config.margin } else { 0 };
     let gap = if use_margin { config.margin.max(1) } else { 0 };
     let list_top = list.row.saturating_sub(gap);
     let list_bottom = end(list).saturating_add(gap);
-    let side_width = cols.saturating_sub(right(list).saturating_add(gap));
+    let side_width = screen_right.saturating_sub(right(list).saturating_add(gap));
 
-    let top = known_from..context.prompt.start.min(rows).saturating_sub(prompt_gap);
-    let bottom = context.prompt.end.saturating_add(prompt_gap).max(known_from)..rows;
+    let top = known_from.max(screen_top).min(screen_bottom)
+        ..context.prompt.start.min(screen_bottom).saturating_sub(prompt_gap);
+    let bottom = context.prompt.end.saturating_add(prompt_gap).max(known_from).max(screen_top)..screen_bottom;
     let [above, below] = [(Position::Above, top), (Position::Below, bottom)].map(|(position, band)| {
         let full_height = band.end.saturating_sub(band.start);
         if list_top < band.end && band.start < list_bottom {
@@ -174,9 +193,9 @@ fn floating_space(config: &Config, context: &Context, known_from: u16, use_margi
             } else {
                 band.end.saturating_sub(list_bottom.max(band.start))
             };
-            [(position, cols, clear_height), (position, side_width, full_height)]
+            [(position, screen_right.saturating_sub(screen_left), clear_height), (position, side_width, full_height)]
         } else {
-            [(position, cols, full_height), (position, 0, 0)]
+            [(position, screen_right.saturating_sub(screen_left), full_height), (position, 0, 0)]
         }
     });
     [above[0], above[1], below[0], below[1]]
@@ -188,23 +207,23 @@ fn floating_corner(
     previous: Option<Placement>,
     size: Floating,
 ) -> Option<Placement> {
-    // Compare the two sides before considering the previous pane's dimensions.
-    // Rows above Lig's origin count towards the geometry, but cannot be painted.
-    let (side, _, _) = floating_space(config, context, 0, true).into_iter().max_by_key(|&(position, w, h)| {
+    let (rows, cols) = context.size;
+    let by_area = |&(position, w, h): &(Position, u16, u16)| {
         (u32::from(w) * u32::from(h), previous.is_some_and(|p| p.position == position), position == Position::Above)
-    })?;
-    let other = if side == Position::Above { Position::Below } else { Position::Above };
+    };
     let preferred = match size {
         Floating::Image { preferred, .. } => preferred,
         _ => None,
     };
-    let configured = preferred_size(config, context.size, context.size, FloatingSize::Configured);
-    let best = |side, use_margin, minimum| {
+    let configured = preferred_size(config, context.size, (cols, rows), FloatingSize::Configured);
+    let spaces = |use_margin| {
         floating_space(config, context, context.known_from, use_margin)
             .into_iter()
             .map(|(position, w, h)| (position, w.min(256), h.min(128)))
-            .filter(|&(position, w, h)| position == side && w >= minimum && h >= minimum)
-            .max_by_key(|&(_, w, h)| match size {
+    };
+    let best = |side, use_margin, minimum| {
+        spaces(use_margin).filter(|&(position, w, h)| position == side && w >= minimum && h >= minimum).max_by_key(
+            |&(_, w, h)| match size {
                 Floating::Tall { content_width } => {
                     let keeps_width = w >= content_width.saturating_add(2).min(configured.0);
                     (keeps_width, false, if keeps_width { u32::from(h) } else { u32::from(w) * u32::from(h) }, w)
@@ -215,15 +234,32 @@ fn floating_corner(
                     let meets_config = preferred.is_none() && w >= config.min_width && h >= config.min_height;
                     (fits, meets_config, u32::from(w) * u32::from(h), w)
                 }
-            })
+            },
+        )
     };
     let framed = |side| best(side, true, 3).or_else(|| best(side, false, 3));
     let available = |side| framed(side).or_else(|| best(side, false, 1));
-    let (position, w, h) = available(side).or_else(|| available(other))?;
+    let (position, w, h) = if matches!(size, Floating::ExpandedText) {
+        let max_width = config.max_width.resolve(cols).unwrap_or(cols);
+        let max_height = config.max_height.resolve(rows).unwrap_or(rows);
+        let largest = |use_margin, minimum| {
+            spaces(use_margin)
+                .map(|(position, w, h)| (position, w.min(max_width), h.min(max_height)))
+                .filter(|&(_, w, h)| w >= minimum && h >= minimum)
+                .max_by_key(by_area)
+        };
+        largest(true, 3).or_else(|| largest(false, 3)).or_else(|| largest(false, 1))?
+    } else {
+        // Compare the two sides before considering the previous pane's dimensions.
+        // Rows above Lig's origin count towards the geometry, but cannot be painted.
+        let (side, _, _) = floating_space(config, context, 0, true).into_iter().max_by_key(by_area)?;
+        let other = if side == Position::Above { Position::Below } else { Position::Above };
+        available(side).or_else(|| available(other))?
+    };
     let (width, height, preferred) = match size {
         Floating::Compact => (configured.0.min(w), configured.1.min(h), None),
         Floating::Tall { .. } => (configured.0.min(w), h, None),
-        Floating::Wide => (w, h, None),
+        Floating::ExpandedText | Floating::Wide => (w, h, None),
         Floating::Image { preset, .. } => {
             let target = preferred.unwrap_or_else(|| {
                 let (width, height) = preferred_size(config, context.size, (w, h), preset);
@@ -237,9 +273,14 @@ fn floating_corner(
             (width, height, Some(target))
         }
     };
-    let (rows, cols) = context.size;
-    let row = if position == Position::Above { context.known_from } else { rows - height };
-    let frame = Rect { row, col: cols - width, width, height };
+    let (screen_vertical, screen_horizontal) = screen_margins(config, context.size);
+    let row = if position == Position::Above {
+        context.known_from.max(screen_vertical)
+    } else {
+        rows.saturating_sub(screen_vertical).saturating_sub(height)
+    };
+    let col = cols.saturating_sub(screen_horizontal).saturating_sub(width);
+    let frame = Rect { row, col, width, height };
     debug_assert!(!overlaps(frame, context.completion));
     Some(Placement { frame, position, inline: false, preferred })
 }
@@ -260,7 +301,6 @@ pub fn inline_at(config: &Config, ctx: &Context, position: Position) -> Option<P
             Position::Left => (list.col, band.end - list.row),
             Position::Above => (cols, list.row - band.start),
             Position::Below => (cols, band.end - end(list)),
-            Position::Auto => unreachable!(),
         };
         let (width, height) = preferred_size(config, ctx.size, available, FloatingSize::Configured);
         let (width, height) = (width.min(available.0), height.min(available.1));
@@ -272,7 +312,6 @@ pub fn inline_at(config: &Config, ctx: &Context, position: Position) -> Option<P
             Position::Left => (list.row, list.col - width),
             Position::Above => (list.row - height, list.col.min(cols - width)),
             Position::Below => (end(list), list.col.min(cols - width)),
-            Position::Auto => unreachable!(),
         };
         let frame = Rect { row, col, width, height };
         return Some(Placement { frame, position, inline: true, preferred: None });
@@ -290,7 +329,7 @@ mod tests {
 
     #[test]
     fn representative_viewports_fit_without_covering_prompt_or_list() {
-        let config = Config::default();
+        let config = Config { screen_margin: 0, ..Config::default() };
         let cases = [
             ((24, 80), rect(4, 3, 10, 33), 0..4, Some(Position::Right)),
             ((40, 120), rect(12, 78, 8, 42), 2..12, Some(Position::Left)),
@@ -318,7 +357,7 @@ mod tests {
 
     #[test]
     fn corner_switches_for_more_area_and_keeps_previous_corner_at_a_tie() {
-        let config = Config { layout: Layout::Floating, position: Position::Left, ..Config::default() };
+        let config = Config { layout: Layout::Floating, screen_margin: 0, ..Config::default() };
         let ctx = Context { size: (40, 80), completion: rect(13, 0, 18, 56), known_from: 0, prompt: 9..12 };
         let solve = |context: &Context, previous| {
             place(&config, context, previous, config.layout, Floating::default()).unwrap()
@@ -337,7 +376,7 @@ mod tests {
 
     #[test]
     fn floating_never_uses_unknown_top_rows_or_pushes_the_list() {
-        let config = Config::default();
+        let config = Config { screen_margin: 0, ..Config::default() };
         let ctx = Context { size: (25, 80), completion: rect(21, 0, 4, 60), known_from: 2, prompt: 19..21 };
         let top = place(&config, &ctx, None, Layout::Floating, Floating::default()).unwrap();
         assert_eq!(top.frame, rect(2, 48, 15, 32));
@@ -347,17 +386,70 @@ mod tests {
     }
 
     #[test]
-    fn auto_floating_fallback_uses_the_same_corner_geometry() {
-        let config = Config { position: Position::Right, ..Config::default() };
+    fn floating_respects_configured_screen_edge_margin() {
+        let config = Config {
+            layout: Layout::Floating,
+            width: crate::config::Size::Cells(20),
+            height: crate::config::Size::Cells(6),
+            min_width: 4,
+            min_height: 3,
+            screen_margin: 10,
+            ..Config::default()
+        };
+        let ctx = Context { size: (40, 100), completion: rect(12, 0, 2, 50), known_from: 10, prompt: 20..22 };
+        let pane = place(&config, &ctx, None, Layout::Floating, Floating::default()).unwrap();
+        assert_eq!(pane.frame.col + pane.frame.width, 90);
+        assert!(pane.frame.row >= 10);
+        assert!(end(pane.frame) <= 30);
+    }
+
+    #[test]
+    fn floating_dimensions_respect_configured_maximums() {
+        let config = Config {
+            layout: Layout::Floating,
+            width: crate::config::Size::Text("60%".into()),
+            height: crate::config::Size::Text("60%".into()),
+            max_width: crate::config::Size::Cells(20),
+            max_height: crate::config::Size::Cells(8),
+            min_width: 4,
+            min_height: 3,
+            screen_margin: 0,
+            ..Config::default()
+        };
+        let ctx = Context { size: (40, 100), completion: rect(20, 0, 3, 100), known_from: 0, prompt: 23..24 };
+        let pane = place(&config, &ctx, None, Layout::Floating, Floating::default()).unwrap();
+        assert_eq!(pane.frame.width, 20);
+        assert_eq!(pane.frame.height, 8);
+    }
+
+    #[test]
+    fn expanded_text_chooses_the_largest_capped_area_on_known_rows() {
+        let config = Config {
+            max_width: crate::config::Size::Cells(50),
+            max_height: crate::config::Size::Cells(16),
+            screen_margin: 2,
+            ..Config::default()
+        };
+        let ctx = Context { size: (40, 100), completion: rect(23, 0, 6, 35), known_from: 16, prompt: 21..23 };
+        let pane = place(&config, &ctx, None, Layout::Floating, Floating::ExpandedText).unwrap();
+        assert_eq!(pane.frame, rect(24, 48, 14, 50));
+        assert!(!overlaps(pane.frame, ctx.completion));
+    }
+
+    #[test]
+    fn automatic_layout_prefers_available_inline_space_before_floating() {
+        let config = Config { screen_margin: 0, ..Config::default() };
         let ctx = Context { size: (30, 80), completion: rect(2, 0, 10, 80), known_from: 0, prompt: 0..2 };
         let auto = place(&config, &ctx, None, Layout::Auto, Floating::default()).unwrap();
-        assert_eq!(auto.frame, rect(13, 48, 17, 32));
-        assert_eq!(Some(auto), place(&config, &ctx, None, Layout::Floating, Floating::default()));
+        assert_eq!(auto.frame, rect(12, 0, 18, 32));
+        assert!(auto.inline);
+        let floating = place(&config, &ctx, None, Layout::Floating, Floating::default()).unwrap();
+        assert_eq!(floating.frame, rect(13, 48, 17, 32));
     }
 
     #[test]
     fn floating_presets_use_both_dimensions_of_the_free_region() {
-        let config = Config { layout: Layout::Floating, position: Position::Right, ..Config::default() };
+        let config = Config { layout: Layout::Floating, screen_margin: 0, ..Config::default() };
         let ctx = Context { size: (40, 120), completion: rect(8, 10, 12, 34), known_from: 0, prompt: 0..8 };
         let mut size = FloatingSize::Configured;
         for (width, height) in [(48, 24), (50, 20), (68, 28), (48, 24)] {
@@ -382,7 +474,7 @@ mod tests {
 
     #[test]
     fn explicit_inline_never_stacks() {
-        let config = Config { position: Position::Below, ..Config::default() };
+        let config = Config { screen_margin: 0, ..Config::default() };
         let ctx = Context { size: (40, 80), completion: rect(7, 0, 8, 74), known_from: 0, prompt: 0..7 };
         assert!(place(&config, &ctx, None, Layout::Inline, Floating::default()).is_none());
         assert_eq!(
@@ -393,7 +485,7 @@ mod tests {
 
     #[test]
     fn remembered_size_moves_to_the_other_corner_then_recovers_after_a_tight_viewport() {
-        let config = Config::default();
+        let config = Config { screen_margin: 0, ..Config::default() };
         let bottom = Context { size: (40, 100), completion: rect(2, 0, 8, 100), known_from: 0, prompt: 0..2 };
         let preset = FloatingSize::Large;
         let large =
@@ -411,7 +503,7 @@ mod tests {
 
     #[test]
     fn larger_half_takes_priority_over_a_smaller_half_that_fits_the_remembered_size() {
-        let config = Config::default();
+        let config = Config { screen_margin: 0, ..Config::default() };
         let ctx = Context { size: (45, 100), completion: rect(35, 0, 7, 50), known_from: 28, prompt: 34..35 };
         let size = Floating::Image { preset: FloatingSize::Large, preferred: Some((32, 8)) };
         let visible = place(&config, &ctx, None, Layout::Floating, size).unwrap();
@@ -425,7 +517,7 @@ mod tests {
 
     #[test]
     fn tiny_floating_area_uses_safe_cells_without_a_border() {
-        let config = Config::default();
+        let config = Config { screen_margin: 0, ..Config::default() };
         let ctx = Context { size: (6, 20), completion: rect(2, 0, 3, 20), known_from: 1, prompt: 1..2 };
         let pane = place(&config, &ctx, None, Layout::Floating, Floating::default()).unwrap();
         assert_eq!(pane.frame, rect(5, 0, 1, 20));

@@ -61,6 +61,12 @@ class TmuxPlacement(unittest.TestCase):
             def capture(history=False):
                 return tmux('capture-pane', '-p', '-t', 'test:0.0', *(['-S', '-'] if history else []))
 
+            def position():
+                return tmux('display-message', '-pt', 'test:0.0', '#{cursor_y} #{history_size}').strip()
+
+            def prior_output(text):
+                return [line for line in text.splitlines() if line and not line.startswith('lig-test')]
+
             def wait_for(text):
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
@@ -101,6 +107,19 @@ class TmuxPlacement(unittest.TestCase):
                 tmux('new-session', '-d', '-x', str(width), '-y', str(height), '-s', 'test', 'sh', '-c', command)
                 wait_for('lig-test')
                 before = capture(history=True)
+                initial_position = position()
+                cursor_row = int(initial_position.split()[0])
+                if cursor_row >= height - 3:
+                    tmux('send-keys', '-t', 'test:0.0', '-l', 'git ch')
+                    self.assertNotIn('checkout', wait_for('git ch'))
+                    self.assertEqual(position(), initial_position)
+                    self.assertEqual(prior_output(capture(history=True)), prior_output(before))
+                    tmux('send-keys', '-t', 'test:0.0', 'C-u', 'C-l')
+                    deadline = time.monotonic() + 5
+                    while not capture().startswith('lig-test') and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertTrue(capture().startswith('lig-test'))
+                    before = capture(history=True)
                 tmux('send-keys', '-t', 'test:0.0', '-l', 'git ch')
                 popup = wait_for('checkout').splitlines()
                 prompt_row = next(i for i, line in enumerate(popup) if line.startswith('lig-test'))
@@ -118,8 +137,6 @@ class TmuxPlacement(unittest.TestCase):
                     time.sleep(.02)
                 self.assertNotIn('checkout', capture(), 'the popup stayed on screen')
                 after = capture(history=True)
-                def prior_output(text):
-                    return [line for line in text.splitlines() if line and not line.startswith('lig-test')]
                 self.assertEqual(prior_output(before), prior_output(after))
                 tmux('send-keys', '-t', 'test:0.0', 'C-l')
                 tmux('send-keys', '-t', 'test:0.0', '-l', 'e')

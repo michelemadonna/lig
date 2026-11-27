@@ -78,7 +78,6 @@ script = "touch unexpected; printf EXTERNAL"
             """[preview]
 enabled = true
 layout = "inline"
-position = "right"
 width = 30
 height = 8
 """
@@ -90,7 +89,7 @@ height = 8
         term.wait_text('ROW_01', start)
         self.assertIn(b' 1 ROW_01', term.plain(start))
         header = list(re.finditer(rb'\x1b\[(\d+);(\d+)H(?:(?!\x1b\[\d+;\d+H).){0,160}'
-                                  + '╭ sample-a.txt '.encode(), term.output[start:]))
+                                  + b'\xe2\x95\xad' + rb'.{0,40}sample-a\.tx', term.output[start:]))
         self.assertTrue(header, term.output[start:])
         row, col = (int(v) for v in header[-1].groups())
         start = len(term.output)
@@ -125,7 +124,7 @@ height = 8
         self.assertFalse((term.home / 'nested').exists())
 
     def test_native_archive_and_webp_without_tools(self):
-        term = self.shell('[preview]\nenabled = true\nlayout = "inline"\nimage_protocol = "cells"\n',
+        term = self.shell('[preview]\nenabled = true\nlayout = "inline"\n[preview.image]\nimage_protocol = "cells"\n',
                           "export PATH=''\n")
         fixtures = Path(__file__).parent / 'fixtures'
         with zipfile.ZipFile(term.home / 'local-a.zip', 'w') as archive:
@@ -262,7 +261,6 @@ output = "mediainfo_json"
             """[preview]
 enabled = true
 layout = "inline"
-position = "right"
 width = 32
 height = 8
 [preview.text]
@@ -286,7 +284,7 @@ script = 'printf "SHELL:%s:%s" "$LIG_PREVIEW_EXT" "$LIG_PREVIEW_HEIGHT"'
         term = self.shell(
             """[preview]
 enabled = true
-start_hidden = true
+show_on = "key_toggle"
 show_title = false
 show_controls = true
 [preview.keys]
@@ -295,7 +293,7 @@ close = "f7"
         )
         selected = term.home / 'sample-a.txt'
         selected.write_text('INITIAL_SELECTED')
-        (term.home / 'sample-b.txt').touch()
+        (term.home / 'sample-b.txt').write_text('SECOND_SELECTED')
         before = len(term.output)
         term.send('cat sample-')
         term.wait_popup('sample-a.txt', before)
@@ -314,6 +312,58 @@ close = "f7"
         term.wait_for(lambda: b'\x1b[?1006l' in term.output[before:])
         self.assertNotIn(b'alt-p preview', term.plain(before))
         self.assertNotIn(b'CHANGED_SELECTED_FILE', term.plain(before))
+        before = len(term.output)
+        term.send(b'\t')
+        time.sleep(0.12)
+        self.assertNotIn(b'SECOND_SELECTED', term.plain(before))
+
+    def test_always_mode_reopens_after_toggle_close_on_next_selection(self):
+        term = self.shell('[preview]\nenabled = true\nshow_on = "always"\n')
+        (term.home / 'sample-a.txt').write_text('ALWAYS_SELECTED_A')
+        (term.home / 'sample-b.txt').write_text('ALWAYS_SELECTED_B')
+        before = len(term.output)
+        term.send('cat sample-')
+        term.wait_text('ALWAYS_SELECTED_A', before)
+        before = len(term.output)
+        term.send(b'\x1bp')
+        time.sleep(0.12)
+        self.assertNotIn(b'ALWAYS_SELECTED_A', term.plain(before))
+        before = len(term.output)
+        term.send(b'\t')
+        term.wait_text('ALWAYS_SELECTED_B', before)
+
+    def test_auto_open_waits_for_stable_selection_and_uses_custom_title_icon(self):
+        term = self.shell(
+            '''[ui]
+icons = "unicode"
+[icons]
+"*.txt" = { glyph = "T", color = "202" }
+[preview]
+enabled = true
+show_on = "on_hover"
+on_hover_open_delay = 350
+animation = "reveal"
+'''
+        )
+        (term.home / 'sample-a.txt').write_text('AUTO_PREVIEW_A')
+        (term.home / 'sample-b.txt').write_text('AUTO_PREVIEW_B')
+        before = len(term.output)
+        term.send('cat sample-')
+        term.wait_popup('sample-a.txt', before)
+        time.sleep(0.12)
+        self.assertNotIn(b'AUTO_PREVIEW_A', term.plain(before))
+        term.wait_text('AUTO_PREVIEW_A', before)
+        self.assertIn(b'T sample-a.txt', term.plain(before))
+
+        before = len(term.output)
+        term.send(b'\x1bp')
+        time.sleep(0.45)
+        self.assertNotIn(b'AUTO_PREVIEW_A', term.plain(before))
+        before = len(term.output)
+        term.send(b'\t')
+        time.sleep(0.12)
+        self.assertNotIn(b'AUTO_PREVIEW_B', term.plain(before))
+        term.wait_text('AUTO_PREVIEW_B', before)
 
     def test_tree_reuses_completion_icon_overrides_and_refreshes_nested_changes(self):
         term = self.shell(
@@ -367,7 +417,7 @@ layout = "inline"
         term.wait_text('UTF16_CONTENT', before)
 
     def test_image_cells_can_be_forced_without_terminal_queries(self):
-        config = '[preview]\nenabled=true\nlayout="inline"\nimage_protocol='
+        config = '[preview]\nenabled=true\nlayout="inline"\n[preview.image]\nimage_protocol='
         for mode in ('cells', 'half_blocks'):
             with self.subTest(mode=mode):
                 term = self.shell(config + f'"{mode}"\n', terminal='iTerm.app')
@@ -446,6 +496,23 @@ layout = "inline"
         self.assertRegex(term.output[before:], rb'\x1b\[\d+X')
         self.assertNotRegex(term.output[before:], sequence)
 
+    def test_unframed_image_falls_back_to_cells_at_bottom_edge(self):
+        term = self.shell('''[preview]
+enabled = true
+layout = "floating"
+screen_margin = 0
+max_height = 2
+''', terminal='iTerm.app')
+        (term.home / 'sample-a.png').write_bytes(png())
+        (term.home / 'sample-b.txt').touch()
+        before = len(term.output)
+        term.send('cat sample-')
+        wait_pattern(term, rb'\x1b\]1337;ReportCellSize\x1b\\', before)
+        after = len(term.output)
+        term.send(b'\x1b]1337;ReportCellSize=16;8\x07')
+        wait_pattern(term, rb';48;2;255;0;153m', after)
+        self.assertNotIn(b'\x1b]1337;File=inline=1', term.output[before:])
+
     def test_floating_portrait_fits_the_frame_then_text_recovers_its_width(self):
         for mode in ('cells', 'half_blocks', 'kitty', 'iterm'):
             with self.subTest(mode=mode):
@@ -456,13 +523,15 @@ layout = "floating"
 width = 40
 height = 14
 adaptive_size = false
+screen_margin = 0
+[preview.image]
 image_protocol = "{protocol}"
 """, terminal='iTerm.app' if mode == 'iterm' else '')
                 (term.home / 'sample-a.png').write_bytes(png(24, 44))
                 (term.home / 'sample-b.txt').write_text('AFTER_PORTRAIT')
                 before = len(term.output)
                 term.send('cat sample-')
-                header = rb'\x1b\[11;65H\x1b\[[0-9;]+m' + '╭ sample-a.pn ─╮'.encode()
+                header = rb'\x1b\[11;65H'
                 wait_pattern(term, header, before)
                 if mode == 'kitty':
                     probe = wait_pattern(term, rb'\x1b_Gi=(\d+),s=1,v=1,a=q,t=d,f=24;AAAA', before)[1]
@@ -481,7 +550,7 @@ image_protocol = "{protocol}"
                 before = len(term.output)
                 term.send(b'\t')
                 term.wait_text('AFTER_PORTRAIT', before)
-                wait_pattern(term, rb'\x1b\[11;41H\x1b\[[0-9;]+m' + '╭ sample-b.txt '.encode(), before)
+                wait_pattern(term, rb'\x1b\[11;41H', before)
 
     def test_binary_fallback_formats_mtime_using_shell_locale(self):
         timestamp = 1635940800
@@ -556,7 +625,7 @@ class PreviewScreen(unittest.TestCase):
         runtime = self.home / 'runtime'
         runtime.mkdir(mode=0o700)
         (config / 'config.toml').write_text(
-            '[preview]\nenabled = true\nlayout = "floating"\nposition = "auto"\nwidth = "40%"\nheight = "60%"\n'
+            '[preview]\nenabled = true\nscreen_margin = 0\nlayout = "floating"\nwidth = "40%"\nheight = "60%"\n'
         )
         (self.home / '.zshenv').write_text('skip_global_compinit=1\n')
         (self.home / '.zshrc').write_text(
@@ -566,6 +635,7 @@ class PreviewScreen(unittest.TestCase):
         (self.home / 'pick-b.txt').write_text('MUST_RESTORE_B\n')
         env = dict(os.environ, HOME=str(self.home), ZDOTDIR=str(self.home),
                    XDG_CONFIG_HOME=str(config.parent), XDG_RUNTIME_DIR=str(runtime),
+                   XDG_CACHE_HOME=str(self.home / 'cache'),
                    XDG_STATE_HOME=str(self.home / 'state'), XDG_DATA_HOME=str(self.home / 'data'),
                    SHELL=ZSH, LIG_LOG='1')
         for key in ['LIG_TTY', 'LIG_DISABLE', 'LIG_PID', 'INSIDE_EMACS']:
@@ -605,6 +675,9 @@ class PreviewScreen(unittest.TestCase):
     def screen(self):
         return self.tmux('capture-pane', '-pt', 'test:0.0')
 
+    def terminal_position(self):
+        return self.tmux('display-message', '-pt', 'test:0.0', '#{cursor_y} #{history_size}').strip()
+
     def wait(self, check):
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
@@ -618,8 +691,9 @@ class PreviewScreen(unittest.TestCase):
     @staticmethod
     def frame(screen, title='pick-a.txt', contains=None):
         lines = screen.splitlines()
+        visible_prefix = title[:max(1, len(title) - 2)] if title is not None else ''
         pattern = re.compile(r'╭[^╮]*╮' if contains else
-                             r'╭─+╮' if title is None else r'╭ ' + re.escape(title) + r' [─]*╮')
+                             r'╭─+╮' if title is None else r'╭ .*?' + re.escape(visible_prefix) + r'.*? [─]*╮')
         for row, line in enumerate(lines):
             for header in pattern.finditer(line):
                 col, right = header.span()
@@ -631,6 +705,8 @@ class PreviewScreen(unittest.TestCase):
         return None
 
     def start_popup(self, config, cols=100, rows=30, command='cat pick-'):
+        if '[preview]\n' in config and 'screen_margin' not in config:
+            config = config.replace('[preview]\n', '[preview]\nscreen_margin = 0\n', 1)
         (self.home / 'config/lig/config.toml').write_text(config)
         self.tmux('new-session', '-d', '-x', str(cols), '-y', str(rows), '-s', 'test', '-c', str(self.home),
                   ZSH, '-i')
@@ -649,6 +725,8 @@ enabled = true
 layout = "floating"
 width = 32
 height = 10
+max_width = 80
+max_height = 22
 [preview.rules.log]
 backend = "shell"
 output = "ansi"
@@ -663,9 +741,9 @@ script = 'printf "%sx%s\n" "$LIG_PREVIEW_WIDTH" "$LIG_PREVIEW_HEIGHT" >> "$HOME/
         self.assertNotIn('1 x', screen)
         self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
         log = self.home / 'preview-viewport'
-        screen = self.wait(lambda s: ansi(s) == (3, 94, 27, 6) and len(log.read_text().splitlines()) >= 2)
+        screen = self.wait(lambda s: ansi(s) == (8, 20, 22, 80) and len(log.read_text().splitlines()) >= 2)
         self.assertNotIn('Unexpected', screen)
-        self.assertEqual(log.read_text().splitlines(), ['30x8', '30x21'])
+        self.assertEqual(log.read_text().splitlines(), ['30x8', '78x20'])
         self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
         self.wait(lambda s: ansi(s) == (27, 94, 3, 6))
         self.tmux('send-keys', '-t', 'test:0.0', 'M-f')
@@ -732,7 +810,7 @@ height = 8
         self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
         self.wait(lambda s: unified(s) == compact)
 
-    def test_images_fit_both_layouts_and_keep_separate_floating_presets(self):
+    def test_images_fit_both_layouts_and_reset_floating_presets(self):
         (self.home / 'pick-a.txt').unlink()
         (self.home / 'pick-b.txt').unlink()
         (self.home / 'pick-a.png').write_bytes(png(120, 16))
@@ -743,9 +821,10 @@ width = 40
 [preview]
 enabled = true
 layout = "inline"
-image_protocol = "cells"
 width = 40
 height = 14
+[preview.image]
+image_protocol = "cells"
 """, rows=36)
 
         def framed(title, check):
@@ -761,21 +840,20 @@ height = 14
         framed(landscape, lambda p: p == (31, 60, 5, 40))
         self.tmux('send-keys', '-t', 'test:0.0', 'Tab', 'Tab')
         compact_text = framed(text, lambda p: p == (33, 82, 3, 18))
+        self.wait(lambda s: self.frame(s, text) == compact_text and 'MUST_RESTORE_C' in s)
         self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
-        tall_text = framed(text, lambda p: p[2] > 20 and p[3] == 18)
+        framed(text, lambda p: p[2] > 20 and p[3] > compact_text[3])
         self.tmux('send-keys', '-t', 'test:0.0', 'C-p')
         framed(portrait, lambda p: p == compact_image)
         self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
         middle = framed(portrait, lambda p: p[2] > compact_image[2] and p[3] > compact_image[3])
         self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
-        large = framed(portrait, lambda p: p[2] > middle[2] and p[3] > middle[3])
-        self.tmux('send-keys', '-t', 'test:0.0', 'Tab')
-        framed(text, lambda p: p == tall_text)
-        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
+        framed(portrait, lambda p: p[2] > middle[2] and p[3] > middle[3])
+        self.tmux('send-keys', '-t', 'test:0.0', 'C-p')
+        framed(landscape, lambda p: p == (31, 60, 5, 40))
+        self.tmux('send-keys', '-t', 'test:0.0', 'Tab', 'Tab')
         framed(text, lambda p: p == compact_text)
         self.tmux('send-keys', '-t', 'test:0.0', 'C-p')
-        framed(portrait, lambda p: p == large)
-        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
         framed(portrait, lambda p: p == compact_image)
 
     def test_directory_archive_and_metadata_fit_native_rows(self):
@@ -818,8 +896,7 @@ width = 85
 [preview]
 enabled = true
 layout = "inline"
-start_hidden = true
-position = "right"
+show_on = "key_toggle"
 """)
         def menu_width(screen):
             match = re.search(r'╭(─+)╮', screen)
@@ -835,14 +912,13 @@ position = "right"
         self.tmux('send-keys', '-t', 'test:0.0', 'M-p')
         self.wait(lambda s: self.frame(s) is None and menu_width(s) == 85 and 'MUST_RESTORE_A' not in s)
 
-    def test_layout_toggle_and_floating_maximum_height_across_terminal_resize(self):
+    def test_layout_toggle_and_floating_zoom_across_terminal_resize(self):
         cols, rows = 100, 30
         self.start_popup("""[ui]
 width = 95
 [preview]
 enabled = true
 layout = "inline"
-position = "right"
 width = 32
 height = 8
 min_width = 32
@@ -868,7 +944,7 @@ adaptive_size = false
             if frame is None or menu is None:
                 return False
             available_rows = rows - (menu[0] + menu[2] + 1)
-            return frame == (rows - available_rows, cols - 32, available_rows, 32) and menu[3] == 95
+            return frame == (rows - available_rows, 0, available_rows, cols) and menu[3] == 95
 
         self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
         self.wait(expanded)
@@ -884,7 +960,108 @@ adaptive_size = false
         self.tmux('send-keys', '-t', 'test:0.0', 'M-p')
         wait_frame(lambda frame: frame[0] == inline[0] and frame[2:] == (8, 32))
 
-    def test_floating_reopens_at_maximum_near_bottom_with_full_scrollback(self):
+    def test_floating_text_zoom_resets_when_switching_candidates(self):
+        (self.home / 'pick-b.txt').write_text('B' * 42 + 'WIDE_MARKER\n' + '\n'.join(MARKS) + '\n')
+        self.start_popup("""[ui]
+width = 70
+[preview]
+enabled = true
+layout = "floating"
+width = 32
+height = 8
+max_width = 80
+max_height = 18
+""")
+        short, long = 'pick-a.txt', 'pick-b.txt'
+
+        def framed(title, dimensions, marker):
+            return self.wait(lambda s: (pane := self.frame(s, title)) and pane[2:] == dimensions and marker in s)
+
+        framed(short, (3, 18), 'MUST_RESTORE_A')
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
+        framed(short, (18, 80), 'MUST_RESTORE_A')
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-p')
+        self.wait(lambda s: self.frame(s, short) is None and 'pick-a.txt' in s)
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-p')
+        framed(short, (18, 80), 'MUST_RESTORE_A')
+        self.tmux('send-keys', '-t', 'test:0.0', 'Tab')
+        compact = framed(long, (8, 32), 'ROW_01')
+        self.assertNotIn('WIDE_MARKER', compact)
+        self.assertNotIn('ROW_10', compact)
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
+        expanded = framed(long, (18, 80), 'WIDE_MARKER')
+        self.assertIn('ROW_10', expanded)
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
+        framed(long, (8, 32), 'ROW_01')
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
+        framed(long, (18, 80), 'WIDE_MARKER')
+        self.tmux('send-keys', '-t', 'test:0.0', 'C-p')
+        framed(short, (3, 18), 'MUST_RESTORE_A')
+        self.tmux('send-keys', '-t', 'test:0.0', 'Tab')
+        framed(long, (8, 32), 'ROW_01')
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
+        framed(long, (18, 80), 'WIDE_MARKER')
+        self.tmux('send-keys', '-t', 'test:0.0', 'C-p', 'Tab')
+        framed(long, (8, 32), 'ROW_01')
+
+    def test_popup_and_previews_near_bottom_leave_terminal_in_place(self):
+        for i in range(12):
+            (self.home / f'pick-extra-{i:02d}').touch()
+        with (self.home / '.zshrc').open('a') as rc:
+            rc.write("if [[ -n $LIG_TTY ]]; then print -l START_ONE START_TWO START_THREE START_FOUR; fi\n")
+        for enabled, layout in [('false', 'floating'), ('true', 'inline'), ('true', 'floating')]:
+            with self.subTest(enabled=enabled, layout=layout):
+                (self.home / 'config/lig/config.toml').write_text(f"""[ui]
+width = 32
+[preview]
+enabled = {enabled}
+layout = "{layout}"
+screen_margin = 0
+min_height = 3
+""")
+                self.tmux('new-session', '-d', '-x', '100', '-y', '18', '-s', 'test', '-c', str(self.home),
+                          '/bin/sh', '-c', 'printf "\\033[4;70HPRE_LIG_OUTPUT\\033[11;1H"; exec "$0" -i', ZSH)
+                try:
+                    original = self.wait(lambda s: 'PRE_LIG_OUTPUT' in s and 'RIGHT_PROMPT' in s)
+                    position = self.terminal_position()
+                    self.tmux('send-keys', '-t', 'test:0.0', '-l', 'cat pick-')
+                    visible = self.wait(lambda s: self.frame(s, None) and
+                                        (enabled == 'false' or 'MUST_RESTORE_A' in s))
+                    self.assertIn('FIRST_PROMPT_LINE', visible)
+                    self.assertIn('PRE_LIG_OUTPUT', visible)
+                    self.assertEqual(self.terminal_position(), position)
+                    if enabled == 'true' and layout == 'floating':
+                        compact = self.frame(visible)
+                        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
+                        self.wait(lambda s: (pane := self.frame(s)) and pane[3] > compact[3])
+                        self.assertEqual(self.terminal_position(), position)
+                    self.tmux('send-keys', '-t', 'test:0.0', 'Escape')
+                    self.wait(lambda s: self.frame(s, None) is None and 'cat pick-' in s)
+                    self.tmux('send-keys', '-t', 'test:0.0', 'C-u')
+                    self.wait(lambda s: s == original)
+                    self.assertEqual(self.terminal_position(), position)
+                finally:
+                    self.close_server()
+
+    def test_popup_stays_hidden_when_no_rows_can_be_restored(self):
+        self.tmux('new-session', '-d', '-x', '100', '-y', '18', '-s', 'test', '-c', str(self.home),
+                  '/bin/sh', '-c', 'printf "\\033[4;70HPRE_LIG_OUTPUT\\033[17;1H"; exec "$0" -i', ZSH)
+        self.wait(lambda s: 'PRE_LIG_OUTPUT' in s and 'RIGHT_PROMPT' in s)
+        position = self.terminal_position()
+        self.tmux('send-keys', '-t', 'test:0.0', '-l', 'cat pick-')
+
+        def ready(screen):
+            return 'cat pick-' in screen and any(
+                re.search(r'render .*items=2 current=true .*rect=None', log.read_text())
+                for log in self.home.rglob('lig.log'))
+
+        visible = self.wait(ready)
+        self.assertIsNone(self.frame(visible, None))
+        self.assertIn('FIRST_PROMPT_LINE', visible)
+        self.assertIn('PRE_LIG_OUTPUT', visible)
+        self.assertEqual(self.terminal_position(), position)
+
+    def test_floating_zoom_near_bottom_with_full_scrollback(self):
         with (self.home / '.zshrc').open('a') as rc:
             rc.write("histfill() { printf 'HISTORY_%03d\\n' {1..310}; }\n")
         self.start_popup("""[ui]
@@ -896,7 +1073,7 @@ adaptive_size = false
 """, 100, 34)
         self.wait(lambda s: self.frame(s) is not None and 'MUST_RESTORE_A' in s)
         self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
-        large = self.frame(self.wait(lambda s: (p := self.frame(s)) and p[2] > 20 and p[3] == 40))
+        large = self.frame(self.wait(lambda s: (p := self.frame(s)) and p[2] > 20 and p[3] == 100))
         self.assertEqual(large[0] + large[2], 34)
         def close_and_clear():
             self.tmux('send-keys', '-t', 'test:0.0', 'Escape')
@@ -910,21 +1087,29 @@ adaptive_size = false
         self.wait(lambda s: 'HISTORY_310' in s and 'RIGHT_PROMPT' in s)
         self.tmux('resize-window', '-t', 'test:0', '-x', '100', '-y', '22')
         baseline = self.wait(lambda s: len(s.splitlines()) == 22 and 'RIGHT_PROMPT' in s)
+        position = self.terminal_position()
         self.tmux('send-keys', '-t', 'test:0.0', '-l', 'cat pick-')
+        self.wait(lambda s: (p := self.frame(s)) and p[3] == 40 and 'MUST_RESTORE_A' in s)
+        self.assertEqual(self.terminal_position(), position)
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
 
         def fills_the_top(screen):
             pane, menu = self.frame(screen), self.frame(screen, None)
-            return pane and menu and pane == (0, 60, menu[0] - 1, 40)
+            return pane and menu and pane == (0, 0, menu[0] - 1, 100)
 
         top = self.wait(fills_the_top)
         self.assertIn('RIGHT_PROMPT', top)
         self.assertIn('FIRST_PROMPT_LINE', top)
+        self.assertEqual(self.terminal_position(), position)
         restored = close_and_clear()
         self.assertEqual(restored, baseline)
+        self.assertEqual(self.terminal_position(), position)
         self.tmux('resize-window', '-t', 'test:0', '-x', '100', '-y', '34')
         self.tmux('send-keys', '-t', 'test:0.0', 'C-l')
         self.wait(lambda s: s.startswith('FIRST_PROMPT_LINE') and 'RIGHT_PROMPT' in s)
         self.tmux('send-keys', '-t', 'test:0.0', '-l', 'cat pick-')
+        self.wait(lambda s: self.frame(s) == (14, 60, 20, 40) and 'MUST_RESTORE_A' in s)
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-z')
         self.wait(lambda s: self.frame(s) == large and 'MUST_RESTORE_A' in s)
 
     def test_floating_compacts_the_list_to_reveal_a_frame_then_restores_it(self):
@@ -935,13 +1120,15 @@ width = 50
 [preview]
 enabled = true
 layout = "floating"
-start_hidden = true
+show_on = "key_toggle"
 """, 50, 9)
         original = (2, 0, 7, 50)
         self.wait(lambda s: self.frame(s, None) == original)
         self.tmux('send-keys', '-t', 'test:0.0', 'M-p')
         self.wait(lambda s: self.frame(s) == (6, 32, 3, 18) and self.frame(s, None) == (2, 0, 4, 50))
         self.tmux('send-keys', '-t', 'test:0.0', 'Tab')
+        self.wait(lambda s: self.frame(s, None) == original and self.frame(s, 'pick-b.txt') is None)
+        self.tmux('send-keys', '-t', 'test:0.0', 'M-p')
         self.wait(lambda s: self.frame(s, 'pick-b.txt') == (6, 32, 3, 18))
         self.tmux('send-keys', '-t', 'test:0.0', 'M-p')
         self.wait(lambda s: self.frame(s, None) == original and self.frame(s, 'pick-b.txt') is None)
@@ -969,6 +1156,7 @@ fi
         (self.home / 'config/lig/config.toml').write_text("""[preview]
 enabled = true
 layout = "floating"
+screen_margin = 0
 width = 32
 height = 6
 adaptive_size = false

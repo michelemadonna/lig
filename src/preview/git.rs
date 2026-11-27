@@ -28,6 +28,7 @@ pub fn preview(
     mode: Git,
     request: &super::Request,
     config: &Config,
+    max_lines: usize,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<(content::Text, Option<Diff>)> {
     let path = &request.path;
@@ -82,7 +83,7 @@ pub fn preview(
     }
     let (before, after) = (String::from_utf8_lossy(&before), String::from_utf8_lossy(&after));
     if before == after {
-        return Some((content::Text::plain("No changes for this tracked path", config.max_lines), None));
+        return Some((content::Text::plain("No changes for this tracked path", max_lines), None));
     }
     let diff = TextDiff::configure().timeout(timeout.min(Duration::from_millis(100))).diff_lines(&before, &after);
     let label = crate::popup::printable(&name);
@@ -93,13 +94,13 @@ pub fn preview(
         let mut delta = Command::new(executable);
         delta.current_dir(cwd).arg("--side-by-side").arg("--paging=never").arg(format!("--width={width}"));
         if let Ok(bytes) = external::run(delta, Some(text.as_bytes()), config.max_bytes, timeout, cancelled)
-            && let Some(text) = content::external(&bytes, config.max_lines, true)
+            && let Some(text) = content::external(&bytes, max_lines, true)
         {
             return Some((text, Some(Diff::SideBySide)));
         }
     }
-    let mut output = content::TextBuilder::new(config.max_lines, false);
-    for line in text.lines().take(config.max_lines) {
+    let mut output = content::TextBuilder::new(max_lines, false);
+    for line in text.lines().take(max_lines) {
         let fg = if line.starts_with('+') {
             Some(content::Color::Index(2))
         } else if line.starts_with('-') {

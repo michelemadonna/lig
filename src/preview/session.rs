@@ -2,9 +2,13 @@
 use std::sync::Arc;
 
 use super::*;
+
+fn animation_frame_at(elapsed: Duration, duration_ms: u64) -> u8 {
+    if duration_ms == 0 { 4 } else { (elapsed.as_millis() * 4 / u128::from(duration_ms)).min(4) as u8 }
+}
 use crate::preview::{
     self, Document, Request, Worker,
-    config::{ImageProtocol, Layout, Position},
+    config::{ImageProtocol, Layout, ShowOn},
     graphics::Graphics,
     layout::{self, Floating, FloatingSize, Placement},
     mouse, render, target,
@@ -49,28 +53,6 @@ enum Input {
     PageDown,
 }
 
-struct ScreenClear {
-    alternate: bool,
-    normal_erased: bool,
-}
-
-impl vte::Perform for ScreenClear {
-    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], ignore: bool, action: char) {
-        if ignore {
-            return;
-        }
-        match (intermediates, action) {
-            ([], 'J') if !self.alternate && params.len() == 1 && params.iter().next() == Some(&[2]) => {
-                self.normal_erased = true;
-            }
-            ([b'?'], 'h' | 'l') if params.iter().any(|arg| matches!(arg, [47] | [1047] | [1049])) => {
-                self.alternate = action == 'h'
-            }
-            _ => {}
-        }
-    }
-}
-
 pub(super) struct State {
     sender: Sender<Event>,
     worker: Option<Worker>,
@@ -78,20 +60,27 @@ pub(super) struct State {
     bindings: Vec<(Key, Input)>,
     pub(super) cwd: PathBuf,
     pub(super) input_tail: String,
-    prompt_top: Option<u16>,
-    screen_clear: vte::Parser,
-    screen_alternate: bool,
     display: bool,
     mode: Layout,
     image_size: FloatingSize,
     image_preferred: Option<(u16, u16)>,
-    tall: bool,
+    expanded: bool,
+    zoom_target: Option<(usize, PathBuf)>,
     selection: Option<usize>,
+    hover_target: Option<(usize, PathBuf)>,
+    hover_at: Option<Instant>,
+    suppressed_selection: Option<(usize, PathBuf)>,
     request: Option<Request>,
     pending_id: u64,
     refresh_at: Option<Instant>,
     doc: Option<Arc<Document>>,
     title: String,
+    title_icon: Option<(String, &'static str)>,
+    loading_since: Option<Instant>,
+    loading_frame: u8,
+    animation_target: Option<(usize, PathBuf)>,
+    animation_started: Option<Instant>,
+    animation_frame: u8,
     scroll: usize,
     // Available areas for rendering. viewport() fits the frame for painting.
     placement: Option<Placement>,
@@ -131,42 +120,63 @@ impl State {
             bindings,
             cwd: PathBuf::new(),
             input_tail: String::new(),
-            prompt_top: None,
-            screen_clear: vte::Parser::new(),
-            screen_alternate: false,
-            display: !config.start_hidden,
+            display: config.show_on == ShowOn::Always,
             mode: config.layout,
             image_size: FloatingSize::default(),
             image_preferred: None,
-            tall: false,
+            expanded: false,
+            zoom_target: None,
             selection: None,
+            hover_target: None,
+            hover_at: None,
+            suppressed_selection: None,
             request: None,
             pending_id: 0,
             refresh_at: None,
             doc: None,
             title: String::new(),
+            title_icon: None,
+            loading_since: None,
+            loading_frame: 0,
+            animation_target: None,
+            animation_started: None,
+            animation_frame: 4,
             scroll: 0,
             placement: None,
             delta_placement: None,
             drawn: None,
             paint: false,
             colors: render::Colors::terminal(),
-            graphics: Graphics::new(config.image_protocol),
+            graphics: Graphics::new(config.image.image_protocol.unwrap_or_default()),
             mouse: mouse::ModeGuard::default(),
             framer: mouse::Framer::default(),
             capture_until: None,
         }
     }
 
-    pub(super) fn mark_prompt(&mut self, screen: &mut vt100::Screen) {
-        if !screen.alternate_screen() {
-            self.prompt_top = Some(screen.cursor_position().0);
-        }
+    fn loading_wake(&self) -> Option<Instant> {
+        let since = self.loading_since?;
+        Some(since + Duration::from_millis(u64::from(self.loading_frame + 1) * 120))
     }
 
-    pub(super) fn reset_prompt(&mut self) {
-        self.prompt_top = None;
-        self.input_tail.clear();
+    fn animation_step(&self) -> u8 {
+        self.animation_frame
+    }
+
+    fn animation_wake(&self, effect: preview::config::Animation, duration_ms: u64) -> Option<Instant> {
+        if effect == preview::config::Animation::None || duration_ms == 0 {
+            return None;
+        }
+        let start = self.animation_started?;
+        let next = u64::from(self.animation_frame + 1);
+        (self.animation_frame < 4).then_some(start + Duration::from_millis((next * duration_ms).div_ceil(4)))
+    }
+
+    fn reset_zoom(&mut self, target: Option<(usize, PathBuf)>) {
+        self.zoom_target = target;
+        self.expanded = false;
+        self.image_size = FloatingSize::default();
+        self.image_preferred = None;
     }
 
     fn cancel(&mut self) {
@@ -181,6 +191,11 @@ impl State {
         self.placement = None;
         self.delta_placement = None;
         self.selection = None;
+        self.loading_since = None;
+        self.loading_frame = 0;
+        self.animation_target = None;
+        self.animation_started = None;
+        self.animation_frame = 4;
     }
 
     fn request(&mut self, request: Request, config: &preview::Config) {
@@ -215,6 +230,8 @@ impl State {
         }
         if !same_source {
             self.doc = None;
+            self.loading_since = Some(Instant::now());
+            self.loading_frame = 0;
         }
         self.refresh_at = None;
         self.paint = true;
@@ -227,11 +244,13 @@ impl State {
     }
 
     fn image_geometry(&self, config: &preview::Config) -> Option<(render::ImageStyle, (u32, u32))> {
-        let r = self.placement?.content();
+        let placement = self.placement?;
+        let r = placement.content();
         let doc = self.visible_document()?;
-        let style = if doc.bitmap().is_some() && self.graphics.protocol().is_some() {
+        // Leave the border as spare space for native image protocols that advance the cursor.
+        let style = if placement.framed() && doc.bitmap().is_some() && self.graphics.protocol().is_some() {
             render::ImageStyle::Bitmap
-        } else if config.image_protocol == ImageProtocol::HalfBlocks {
+        } else if config.image.image_protocol.unwrap_or_default() == ImageProtocol::HalfBlocks {
             render::ImageStyle::HalfBlocks
         } else {
             render::ImageStyle::Quadrants
@@ -259,12 +278,12 @@ impl State {
         } else {
             placement
         };
-        if !config.adaptive_size {
+        if !config.adaptive_size || (self.expanded && !placement.inline && doc.is_some_and(|doc| doc.file_text)) {
             return Some(placement);
         }
         let (width, height) =
             doc.map_or((16, 1), |doc| (doc.width(ui), doc.content.lines().min(usize::from(u16::MAX)) as u16));
-        Some(placement.fit((width, if self.tall && !placement.inline { u16::MAX } else { height })))
+        Some(placement.fit((width, if self.expanded && !placement.inline { u16::MAX } else { height })))
     }
 
     fn scroll(&mut self, down: bool, page: bool, config: &preview::Config, ui: &crate::config::Ui) -> bool {
@@ -291,7 +310,12 @@ impl State {
         self.mouse.set(enabled, screen, out);
     }
 
-    fn prompt(&mut self, screen: &mut vt100::Screen, fallback_top: Option<u16>) -> std::ops::Range<u16> {
+    fn prompt(
+        &self,
+        screen: &vt100::Screen,
+        prompt_top: Option<u16>,
+        fallback_top: Option<u16>,
+    ) -> std::ops::Range<u16> {
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
         let mut input_top = cursor_row;
@@ -327,62 +351,89 @@ impl State {
             end += 1;
         }
 
-        let start = self.prompt_top.filter(|&start| start <= input_top);
+        let start = prompt_top.filter(|&start| start <= input_top);
         start.unwrap_or(0)..end
     }
 }
 
 impl Session {
-    pub(super) fn process_preview_output(&mut self, bytes: &[u8]) {
-        let Some(preview) = self.preview.as_mut() else {
-            self.parser.process(bytes);
-            return;
-        };
-        if self.unknown_rows != 0 {
-            let mut clear = ScreenClear {
-                alternate: preview.screen_alternate || self.parser.screen().alternate_screen(),
-                normal_erased: false,
-            };
-            preview.screen_clear.advance(&mut clear, bytes);
-            preview.screen_alternate = clear.alternate;
-            if clear.normal_erased {
-                self.unknown_rows = 0;
-            }
+    pub(super) fn preview_selection_changed(&mut self) {
+        if let Some(preview) = &mut self.preview {
+            preview.reset_zoom(None);
+            preview.selection = None;
         }
-        if preview.prompt_top.is_none() {
-            self.parser.process(bytes);
-            return;
-        }
-        // vt100 keeps an offset of one anchored when the screen scrolls, even after
-        // the scrollback buffer is full. Restore the live view before using the model.
-        let screen = self.parser.screen_mut();
-        screen.set_scrollback(1);
-        let base = screen.scrollback();
-        self.parser.process(bytes);
-        let screen = self.parser.screen_mut();
-        if base == 0 {
-            screen.set_scrollback(usize::MAX);
-        }
-        let after = screen.scrollback();
-        screen.set_scrollback(0);
-        preview.prompt_top = after.checked_sub(base).filter(|_| !screen.alternate_screen()).and_then(|scroll| {
-            let row = preview.prompt_top?;
-            Some(if after >= PROMPT_HISTORY { 0 } else { row.saturating_sub(scroll as u16) })
-        });
     }
 
     pub(super) fn preview_wake(&self) -> Option<Instant> {
         let preview = self.preview.as_ref()?;
-        [preview.framer.wake(), preview.graphics.wake(), preview.refresh_at].into_iter().flatten().min()
+        [
+            preview.framer.wake(),
+            preview.graphics.wake(),
+            preview.refresh_at,
+            preview.hover_at,
+            preview.loading_wake(),
+            preview.animation_wake(self.cfg.preview.animation, self.cfg.preview.animation_duration_ms),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub(super) fn preview_tick(&mut self) {
+        let now = Instant::now();
+        let auto_due = self.preview.as_ref().is_some_and(|p| p.hover_at.is_some_and(|at| at <= now));
+        if auto_due {
+            let target = self.preview.as_ref().and_then(|p| p.hover_target.as_ref());
+            let still_selected = target.is_some_and(|(index, path)| {
+                *index == self.selected
+                    && self.items.get(*index).is_some_and(target::file_candidate)
+                    && self
+                        .items
+                        .get(*index)
+                        .and_then(|item| target::file_from_candidate(&self.line, item, &self.preview.as_ref()?.cwd))
+                        == Some(path.clone())
+            });
+            if self.popup_open() && self.resync.is_none() && still_selected {
+                if let Some(preview) = &mut self.preview {
+                    preview.display = true;
+                    preview.hover_at = None;
+                    preview.paint = true;
+                    preview.animation_started = Some(now);
+                    preview.animation_frame = 0;
+                    preview.animation_target = preview.hover_target.clone();
+                    self.mark_dirty();
+                }
+            } else if let Some(preview) = &mut self.preview {
+                preview.hover_at = None;
+            }
+        }
+        let mut needs_redraw = false;
         if let Some(preview) = &mut self.preview {
+            if let Some(since) = preview.loading_since {
+                let frame = (since.elapsed().as_millis() / 120).min(u128::from(u8::MAX)) as u8;
+                if frame > preview.loading_frame {
+                    preview.loading_frame = frame;
+                    needs_redraw = true;
+                }
+            }
+            if self.cfg.preview.animation != preview::config::Animation::None
+                && self.cfg.preview.animation_duration_ms > 0
+                && let Some(started) = preview.animation_started
+            {
+                let frame = animation_frame_at(started.elapsed(), self.cfg.preview.animation_duration_ms);
+                if frame > preview.animation_frame {
+                    preview.animation_frame = frame;
+                    needs_redraw = true;
+                }
+            }
+            if needs_redraw {
+                preview.paint = true;
+            }
             let mut out = Vec::new();
             let (keys, redraw) = preview.graphics.tick(&mut out);
             preview.paint |= redraw;
             if redraw {
-                self.mark_dirty();
+                needs_redraw = true;
             }
             if !out.is_empty() {
                 self.write_out(&out);
@@ -390,6 +441,9 @@ impl Session {
             if !keys.is_empty() {
                 self.on_preview_input(&keys);
             }
+        }
+        if needs_redraw {
+            self.mark_dirty();
         }
         if let Some(bytes) = self.preview.as_mut().and_then(|p| p.framer.expired()) {
             self.on_input(&bytes);
@@ -455,13 +509,37 @@ impl Session {
         };
         match action {
             action @ (Input::Toggle | Input::Open | Input::Close | Input::ToggleLayout) => {
-                if !self.items.get(self.selected).is_some_and(target::file_candidate) {
+                let Some(item) = self.items.get(self.selected).filter(|item| target::file_candidate(item)) else {
                     return false;
-                }
+                };
+                let current_key =
+                    target::file_from_candidate(&self.line, item, &preview.cwd).map(|path| (self.selected, path));
                 match action {
-                    Input::Toggle => preview.display = !preview.display,
-                    Input::Open => preview.display = true,
-                    Input::Close if preview.display => preview.display = false,
+                    Input::Toggle => {
+                        preview.display = !preview.display;
+                        if preview.display {
+                            preview.suppressed_selection = None;
+                            preview.animation_target = current_key.clone();
+                            preview.animation_started = Some(Instant::now());
+                            preview.animation_frame = 0;
+                        } else {
+                            preview.suppressed_selection = current_key.clone();
+                        }
+                        preview.hover_at = None;
+                    }
+                    Input::Open => {
+                        preview.display = true;
+                        preview.suppressed_selection = None;
+                        preview.hover_at = None;
+                        preview.animation_target = current_key.clone();
+                        preview.animation_started = Some(Instant::now());
+                        preview.animation_frame = 0;
+                    }
+                    Input::Close if preview.display => {
+                        preview.display = false;
+                        preview.suppressed_selection = current_key.clone();
+                        preview.hover_at = None;
+                    }
                     Input::Close => return false,
                     Input::ToggleLayout => {
                         let inline = match preview.mode {
@@ -483,12 +561,19 @@ impl Session {
                 {
                     return false;
                 }
+                let path = self
+                    .items
+                    .get(self.selected)
+                    .and_then(|item| target::file_from_candidate(&self.line, item, &preview.cwd));
+                if path.as_ref() != preview.zoom_target.as_ref().map(|(_, path)| path) {
+                    return false;
+                }
                 let Some(doc) = &preview.doc else { return true };
                 if doc.image_size().is_some() {
                     preview.image_size = preview.image_size.next();
                     preview.image_preferred = None;
                 } else {
-                    preview.tall = !preview.tall;
+                    preview.expanded = !preview.expanded;
                 }
                 true
             }
@@ -512,6 +597,7 @@ impl Session {
             preview.refresh_at = Some(Instant::now() + refresh);
             if preview.doc.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &result)) {
                 preview.doc = Some(result);
+                preview.loading_since = None;
                 preview.paint = true;
                 self.mark_dirty();
             }
@@ -525,23 +611,90 @@ impl Session {
         fresh: bool,
         known_from: u16,
     ) {
+        let closed = !self.drawable() || self.remote.is_some() || self.history_mode;
         let Some(preview) = self.preview.as_mut() else { return };
-        let Some(original) = list.as_ref().filter(|_| self.remote.is_none() && !self.history_mode) else {
+        let Some(original) = list.as_mut().filter(|_| !closed) else {
             preview.cancel();
+            preview.hover_target = None;
+            preview.hover_at = None;
             preview.graphics.end_popup();
-            preview.display = !self.cfg.preview.start_hidden;
+            if closed {
+                preview.reset_zoom(None);
+                preview.suppressed_selection = None;
+                preview.display = self.cfg.preview.show_on == ShowOn::Always;
+            }
             return;
         };
-        if !fresh || !preview.display || preview.unavailable {
+        if !fresh || preview.unavailable {
+            preview.cancel();
+            preview.hover_target = None;
+            preview.hover_at = None;
+            return;
+        }
+        let Some(item) = items.get(self.selected).filter(|item| target::file_candidate(item)) else {
+            preview.cancel();
+            preview.reset_zoom(None);
+            preview.hover_target = None;
+            preview.hover_at = None;
+            preview.suppressed_selection = None;
+            preview.display = self.cfg.preview.show_on == ShowOn::Always;
+            return;
+        };
+        let Some(path) = target::file_from_candidate(&self.line, item, &preview.cwd) else {
+            preview.cancel();
+            preview.reset_zoom(None);
+            preview.hover_target = None;
+            preview.hover_at = None;
+            preview.suppressed_selection = None;
+            preview.display = self.cfg.preview.show_on == ShowOn::Always;
+            return;
+        };
+        let key = (self.selected, path.clone());
+        if preview.zoom_target.as_ref() != Some(&key) {
+            preview.reset_zoom(Some(key.clone()));
+        }
+        let (glyph, color) =
+            crate::icons::glyph(item.kind, item.icon, &item.label, crate::icons::use_nerd(&self.cfg.ui.icons));
+        preview.title_icon = (self.cfg.ui.icons != "none").then(|| (glyph.to_owned(), color));
+        let changed = preview.animation_target.as_ref().is_some_and(|current| current != &key);
+        if changed {
+            preview.hover_at = None;
+            preview.hover_target = None;
+            match self.cfg.preview.show_on {
+                ShowOn::Always => {
+                    preview.display = true;
+                    preview.suppressed_selection = None;
+                }
+                ShowOn::KeyToggle | ShowOn::OnHover => preview.display = false,
+            }
+        }
+        if preview.suppressed_selection.as_ref() != Some(&key) {
+            preview.suppressed_selection = None;
+        }
+        if self.cfg.preview.show_on == ShowOn::Always && preview.suppressed_selection.is_none() {
+            preview.display = true;
+        }
+        if !preview.display {
+            if self.cfg.preview.show_on == ShowOn::OnHover && preview.suppressed_selection.is_none() {
+                if preview.hover_target.as_ref() != Some(&key) {
+                    preview.hover_target = Some(key.clone());
+                    preview.hover_at =
+                        Some(Instant::now() + Duration::from_millis(self.cfg.preview.on_hover_open_delay));
+                }
+            } else {
+                preview.hover_target = None;
+                preview.hover_at = None;
+            }
             preview.cancel();
             return;
         }
-        let Some(path) =
-            items.get(self.selected).and_then(|item| target::file_from_candidate(&self.line, item, &preview.cwd))
-        else {
-            preview.cancel();
-            return;
-        };
+        preview.hover_target = None;
+        preview.hover_at = None;
+        if preview.animation_target.as_ref() != Some(&key) {
+            preview.animation_target = Some(key.clone());
+            preview.animation_started = Some(Instant::now());
+            preview.animation_frame = 0;
+        }
         let git = target::git_context(&self.line, &self.items_command, &self.env.aliases);
         let config = &self.cfg.preview;
         let doc = preview
@@ -554,23 +707,32 @@ impl Session {
                     && request.search_path == self.env.path
             })
             .and(preview.doc.as_deref());
-        let ordinary = if preview.tall { Floating::Tall { content_width: u16::MAX } } else { Floating::Compact };
+        let expanded_text = preview.expanded && doc.is_some_and(|doc| doc.file_text);
+        let ordinary = if expanded_text {
+            Floating::ExpandedText
+        } else if preview.expanded {
+            Floating::Tall { content_width: u16::MAX }
+        } else {
+            Floating::Compact
+        };
         let image = doc.is_some_and(|doc| doc.image_size().is_some());
         let floating = if image {
             Floating::Image { preset: preview.image_size, preferred: preview.image_preferred }
         } else {
             ordinary
         };
-        let wide = preview.tall && doc.is_some_and(|doc| doc.git_diff.is_some());
+        let wide = preview.expanded && doc.is_some_and(|doc| doc.git_diff.is_some());
         let tall_width = doc
-            .filter(|doc| config.adaptive_size && preview.tall && !image && doc.git_diff.is_none())
+            .filter(|doc| {
+                config.adaptive_size && preview.expanded && !expanded_text && !image && doc.git_diff.is_none()
+            })
             .map(|doc| doc.width(&self.cfg.ui));
-        let screen = self.parser.screen_mut();
+        let screen = self.parser.screen();
         let mut context = layout::Context {
             size: screen.size(),
             completion: original.rect,
             known_from,
-            prompt: preview.prompt(screen, self.prompt_end.as_ref().map(|p| p.row)),
+            prompt: preview.prompt(screen, self.prompt_top, self.prompt_end.as_ref().map(|p| p.row)),
         };
         let cursor = screen.cursor_position();
         let prompt = context.prompt.clone();
@@ -583,9 +745,9 @@ impl Session {
                 size,
                 (prompt.end.saturating_sub(1).max(cursor.0), cursor.1),
                 prompt.start,
+                known_from,
                 token.width().min(usize::from(u16::MAX)) as u16,
             )
-            .filter(|l| l.rect.row >= known_from)
         };
         let mut replacement = None;
         let list_end = original.rect.row.saturating_add(original.rect.height);
@@ -594,10 +756,13 @@ impl Session {
             // preview, also keep the list clear of a multiline prompt or buffer tail.
             let Some(safe) = layout_list(&self.cfg.ui) else {
                 preview.cancel();
+                if self.prompt_top.is_some() {
+                    *list = None;
+                }
                 return;
             };
             context.completion = safe.rect;
-            replacement = Some(safe);
+            *original = safe;
         }
         let mut placement = layout::place(config, &context, preview.placement, preview.mode, floating);
         if preview.mode != Layout::Inline && placement.is_none_or(|p| !p.framed()) {
@@ -630,10 +795,12 @@ impl Session {
             // right-edge clamp imposed by a wide list.
             if let Some(narrow) = layout_list(&ui) {
                 let mut best_width = 0;
-                for side in layout::inline_sides(config.position) {
+                for side in layout::inline_sides() {
                     let width = match side {
-                        Position::Right => size.1.saturating_sub(narrow.rect.col.saturating_add(config.min_width)),
-                        Position::Left if narrow.rect.col >= config.min_width => size.1 - config.min_width,
+                        layout::Position::Right => {
+                            size.1.saturating_sub(narrow.rect.col.saturating_add(config.min_width))
+                        }
+                        layout::Position::Left if narrow.rect.col >= config.min_width => size.1 - config.min_width,
                         _ => continue,
                     }
                     .min(context.completion.width);
@@ -743,9 +910,21 @@ impl Session {
                 preview.visible_document().map(|doc| &doc.content),
                 if self.cfg.preview.show_title { &preview.title } else { "" },
                 preview.scroll,
-                render::Options { colors: preview.colors, image },
+                render::Options {
+                    colors: preview.colors,
+                    image,
+                    title_icon: self.cfg.preview.show_title.then(|| preview.title_icon.clone()).flatten(),
+                    loading_frame: preview.loading_frame,
+                    animation: (self.cfg.preview.animation != preview::config::Animation::None
+                        && self.cfg.preview.animation_duration_ms > 0
+                        && preview.animation_step() < 4)
+                        .then_some((self.cfg.preview.animation, preview.animation_step())),
+                },
             );
             if let Some((render::ImageStyle::Bitmap, dimensions)) = image
+                && (self.cfg.preview.animation == preview::config::Animation::None
+                    || self.cfg.preview.animation_duration_ms == 0
+                    || preview.animation_step() >= 4)
                 && let Some(payload) = preview.doc.as_ref().and_then(|doc| doc.bitmap())
             {
                 preview.graphics.draw(out, placement.content(), dimensions, payload);
@@ -771,16 +950,8 @@ impl Session {
         self.write_out(&bytes);
     }
 
-    pub(super) fn preview_shift(&mut self, shift: i32, rows: u16, reflow: bool) {
+    pub(super) fn preview_shift(&mut self, shift: i32, rows: u16) {
         if let Some(preview) = &mut self.preview {
-            if reflow || shift < 0 {
-                preview.screen_clear = vte::Parser::new();
-                preview.screen_alternate = self.parser.screen().alternate_screen();
-            }
-            preview.prompt_top = preview
-                .prompt_top
-                .filter(|_| !reflow)
-                .map(|row| (i32::from(row) - shift).clamp(0, i32::from(rows) - 1) as u16);
             preview.drawn =
                 preview.drawn.and_then(|p| shifted(p.frame, shift, rows).map(|frame| Placement { frame, ..p }));
             preview.paint = true;
@@ -796,17 +967,14 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::ScreenClear;
+    use super::animation_frame_at;
+    use std::time::Duration;
 
     #[test]
-    fn only_a_real_full_clear_of_the_normal_screen_makes_its_rows_known() {
-        let mut tracker = ScreenClear { alternate: false, normal_erased: false };
-        let mut parser = vte::Parser::new();
-        parser.advance(&mut tracker, b"\x1b[?1049h\x1b[2J\x1b[?1049l\x1b[0J\x1b[?2J");
-        assert!(!tracker.normal_erased);
-        parser.advance(&mut tracker, b"\x1b[2");
-        assert!(!tracker.normal_erased);
-        parser.advance(&mut tracker, b"J\x1b[37;1H");
-        assert!(tracker.normal_erased);
+    fn animation_duration_controls_the_four_transition_frames() {
+        assert_eq!(animation_frame_at(Duration::ZERO, 300), 0);
+        assert_eq!(animation_frame_at(Duration::from_millis(75), 300), 1);
+        assert_eq!(animation_frame_at(Duration::from_millis(300), 300), 4);
+        assert_eq!(animation_frame_at(Duration::ZERO, 0), 4);
     }
 }

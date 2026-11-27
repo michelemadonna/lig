@@ -132,6 +132,7 @@ pub fn open_file(path: &Path) -> io::Result<File> {
 
 pub struct Options<'a> {
     pub config: &'a Config,
+    pub engine: &'a Engine,
     pub light: bool,
     pub show_hidden: bool,
     pub cancelled: &'a dyn Fn() -> bool,
@@ -151,7 +152,7 @@ impl Previewer for Category {
             Self::Text => Content::Text(text(path, file, opts)?),
             Self::Image => Content::Image(Raster::new(
                 image(file, header, opts.cancelled)?,
-                opts.config.image_protocol == ImageProtocol::Auto,
+                opts.config.image.image_protocol.unwrap_or_default() == ImageProtocol::Auto,
                 opts.cancelled,
             )?),
             Self::Archive => Content::Text(archive(path, file, header, opts)?),
@@ -165,11 +166,12 @@ fn text(path: &Path, file: File, opts: &Options<'_>) -> anyhow::Result<Text> {
     let mut raw = Vec::new();
     CancelRead(file, opts.cancelled).take(opts.config.max_bytes as u64).read_to_end(&mut raw)?;
     let text = decode_text(&raw)?;
-    let mut out = TextBuilder::new(opts.config.max_lines, opts.config.line_numbers);
+    let max_lines = opts.engine.max_lines;
+    let mut out = TextBuilder::new(max_lines, opts.engine.line_numbers.unwrap_or(true));
 
     static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
     static THEMES: OnceLock<ThemeSet> = OnceLock::new();
-    let highlight = opts.config.syntax_highlighting.then(|| {
+    let highlight = opts.engine.syntax_highlighting.unwrap_or(true).then(|| {
         let syntaxes = SYNTAXES.get_or_init(two_face::syntax::extra_newlines);
         let themes = THEMES.get_or_init(ThemeSet::load_defaults);
         let theme = &themes.themes[if opts.light { "InspiredGitHub" } else { "base16-ocean.dark" }];
@@ -195,7 +197,7 @@ fn text(path: &Path, file: File, opts: &Options<'_>) -> anyhow::Result<Text> {
     });
     let mut highlight = highlight;
     let mut highlighted = 0;
-    for line in text.split_inclusive('\n').take(opts.config.max_lines) {
+    for line in text.split_inclusive('\n').take(max_lines) {
         anyhow::ensure!(!(opts.cancelled)(), "cancelled");
         // The regex engine's cost is bounded independently of a user-supplied file size.
         // A skipped line invalidates the lexical state of subsequent lines.
@@ -299,7 +301,7 @@ impl DirectoryTree<'_, '_> {
             if (self.opts.cancelled)() {
                 return Err(io::Error::other("cancelled"));
             }
-            if self.rows.len() >= self.opts.config.max_lines {
+            if self.rows.len() >= self.opts.engine.max_lines {
                 break;
             }
             let last = index + 1 == count;
@@ -308,7 +310,7 @@ impl DirectoryTree<'_, '_> {
             if directory
                 && level < 3
                 && self.remaining > 0
-                && self.rows.len() < self.opts.config.max_lines
+                && self.rows.len() < self.opts.engine.max_lines
                 && std::fs::symlink_metadata(&path).is_ok_and(|meta| traversable_directory(&meta))
             {
                 let branch = if last { "    " } else { "│   " };
@@ -474,8 +476,8 @@ fn archive_summary(format: &str, count: usize, dirs: usize, total: Option<usize>
 
 fn archive(path: &Path, mut file: File, header: &[u8], opts: &Options<'_>) -> anyhow::Result<Text> {
     let ext = extension(path);
-    let max_entries = opts.config.max_lines.saturating_sub(1);
-    let mut listing = Listing::new(opts.config.max_lines);
+    let max_entries = opts.engine.max_lines.saturating_sub(1);
+    let mut listing = Listing::new(opts.engine.max_lines);
     let gzip = header.starts_with(b"\x1f\x8b");
     let tar = header.get(257..262) == Some(b"ustar");
     if header.starts_with(b"PK\x03\x04") || header.starts_with(b"PK\x05\x06") || (ext == "zip" && !gzip && !tar) {
@@ -510,7 +512,7 @@ fn archive(path: &Path, mut file: File, header: &[u8], opts: &Options<'_>) -> an
         file.read_exact(&mut trailer)?;
         return Ok(Text::plain(
             &format!("GZIP\n{filename}\nLast member size (mod 4 GiB): {} bytes", u32::from_le_bytes(trailer)),
-            opts.config.max_lines,
+            opts.engine.max_lines,
         ));
     }
 
