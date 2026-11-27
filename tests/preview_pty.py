@@ -1185,6 +1185,32 @@ known_screen() { printf '\\033[2J\\033[37;1H'; }
         after = self.wait(lambda s: self.frame(s) == (0, 68, 6, 32) and 'MUST_RESTORE_A' in s)
         self.assertIn('RIGHT_PROMPT', after)
 
+    def test_first_toggle_at_bottom_preserves_output_above_lig_start(self):
+        with (self.home / 'config/lig/config.toml').open('a') as config:
+            config.write('\n[behavior]\ntoggle_only = true\n\n[keys]\ntoggle = ["ctrl-space"]\n')
+        with (self.home / '.zshrc').open('a') as rc:
+            rc.write("PROMPT='preview-test> '\n")
+        workdir = self.home / 'work'
+        directory = workdir / 'pick-folder'
+        directory.mkdir(parents=True)
+        (directory / 'PREVIEW_PAYLOAD.txt').touch()
+        self.tmux('new-session', '-d', '-x', '140', '-y', '30', '-s', 'test', '-c', str(workdir),
+                  '/bin/sh', '-c', r'printf "\033[1;1HPRE_LIG_OUTPUT\033[30;1H"; exec "$0" -i', ZSH)
+        original = self.wait(lambda s: 'PRE_LIG_OUTPUT' in s and 'RIGHT_PROMPT' in s)
+        self.assertIn('preview-test>', original.splitlines()[29])
+        self.tmux('send-keys', '-t', 'test:0.0', '-l', 'cd ')
+        self.wait(lambda s: 'preview-test> cd ' in s)
+        self.tmux('send-keys', '-t', 'test:0.0', 'C-Space')
+        self.wait(lambda s: 'pick-folder/' in s)
+        self.tmux('send-keys', '-t', 'test:0.0', '-l', 'pick-')
+        visible = self.wait(lambda s: 'PREVIEW_PAYLOAD.txt' in s and 'pick-folder/' in s)
+        self.assertRegex(visible, r'preview-test> cd pick- +RIGHT_PROMPT')
+        self.tmux('send-keys', '-t', 'test:0.0', 'Escape')
+        restored = self.wait(lambda s: 'PREVIEW_PAYLOAD' not in s and 'pick-folder/' not in s)
+        self.assertNotIn('PRE_LIG_OUTPUT', restored)
+        scrollback = self.tmux('capture-pane', '-pt', 'test:0.0', '-S', '-')
+        self.assertEqual(scrollback.count('PRE_LIG_OUTPUT'), 1)
+
     def test_floating_preview_preserves_prompt_restores_screen_and_survives_resize(self):
         self.tmux('new-session', '-d', '-x', '100', '-y', '30', '-s', 'test', '-c', str(self.home),
                   ZSH, '-i')

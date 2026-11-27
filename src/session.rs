@@ -2358,6 +2358,15 @@ impl Session {
         let mut typed: Option<String> = Some(String::new());
         for (n, (raw, key)) in keys.iter().enumerate() {
             let (raw, key) = (*raw, key.clone());
+            let toggle = self.bindings.action(&key) == Some(Action::Toggle);
+            let wait_for_line = passthrough && typed.as_ref().is_some_and(|text| !text.is_empty());
+            // A toggle can arrive before the startup cursor report, or in the same
+            // read as the text it applies to. Defer drawing until the screen is ready.
+            if toggle && self.can_request_popup() && (!passthrough || (wait_for_line && !self.popup_open())) {
+                self.toggle(!wait_for_line);
+                redraw = true;
+                continue;
+            }
             if passthrough {
                 // Enter typed fast after other keys: the line isn't updated yet, so hold
                 // Enter until the shell reports it and its suggestions are ready.
@@ -2386,11 +2395,6 @@ impl Session {
             let history_key = matches!(self.bindings.action(&key), Some(Action::History | Action::FolderHistory));
             if history_key && self.history.is_some() && self.can_show() {
                 self.toggle_history(self.bindings.action(&key) == Some(Action::FolderHistory));
-                redraw = true;
-                continue;
-            }
-            if self.bindings.action(&key) == Some(Action::Toggle) && self.can_show() {
-                self.toggle();
                 redraw = true;
                 continue;
             }
@@ -2542,9 +2546,13 @@ impl Session {
         }
     }
 
-    /// The popup may be shown now (the shell is editing a line, nothing hides it).
+    fn can_request_popup(&self) -> bool {
+        self.editing && !self.hidden && !self.full_screen_app() && !self.foreign
+    }
+
+    /// The popup may be shown once the startup cursor has been resolved.
     fn can_show(&self) -> bool {
-        self.startup_cursor.is_none() && self.editing && !self.hidden && !self.full_screen_app() && !self.foreign
+        self.startup_cursor.is_none() && self.can_request_popup()
     }
 
     /// A full-screen app (vim, less…) has the screen: the alternate one, except mosh's client's.
@@ -2612,7 +2620,7 @@ impl Session {
     }
 
     /// Close the popup, or ask for suggestions even where it doesn't open by itself (command names).
-    fn toggle(&mut self) {
+    fn toggle(&mut self, request_now: bool) {
         if self.popup_open() {
             self.dismiss();
         } else {
@@ -2621,7 +2629,9 @@ impl Session {
             self.dismissed = None;
             self.navigated = false;
             self.items_line.clear();
-            self.request();
+            if request_now {
+                self.request();
+            }
         }
     }
 
@@ -3122,8 +3132,37 @@ impl Session {
         });
         let is_message = message.is_some();
         let shown: Vec<Suggestion> = if fresh || keep { self.items.clone() } else { message.into_iter().collect() };
-        let known_from = self.known_from();
+        let mut known_from = self.known_from();
         let mut layout = self.popup_layout(&shown, known_from);
+        if layout.is_none()
+            && fresh
+            && self.manual
+            && !self.history_mode
+            && known_from > 0
+            && let Some(space) = self.popup_layout(&shown, 0)
+        {
+            let (rows, _) = self.parser.screen().size();
+            let (row, col) = self.parser.screen().cursor_position();
+            let scroll = space.rect.height.saturating_sub(rows - row - 1).min(row);
+            if scroll > 0 {
+                self.erase(&mut w);
+                self.begin_sync(&mut w);
+                // Move older output into scrollback to make known space below the prompt.
+                let bytes = format!(
+                    "\x1b[{rows};1H{}\x1b[{};{}H",
+                    "\n".repeat(usize::from(scroll)),
+                    row + 1 - scroll,
+                    col + 1,
+                );
+                w.extend_from_slice(bytes.as_bytes());
+                self.process_child_screen(bytes.as_bytes());
+                if let Some(prompt) = &mut self.prompt_end {
+                    prompt.row = prompt.row.saturating_sub(scroll);
+                }
+                known_from = self.known_from();
+                layout = self.popup_layout(&shown, known_from);
+            }
+        }
         // Kept suggestions stay put: their anchor (`delete`) is for the old line.
         if keep && let (Some(l), Some(old)) = (layout.as_mut(), self.shown) {
             l.rect.col = old.col.min(self.parser.screen().size().1.saturating_sub(l.rect.width));
