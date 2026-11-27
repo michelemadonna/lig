@@ -1225,13 +1225,21 @@ impl Session {
         self.fish_refresh.as_ref().is_some_and(|refresh| refresh.stale)
     }
 
+    /// Automatic suggestions may be drawn, or the user explicitly asked for them.
+    fn completion_requested(&self) -> bool {
+        !self.cfg.behavior.toggle_only || self.manual
+    }
+
     fn visible(&self) -> bool {
         !self.fish_stale() && self.items_line == self.line && self.drawable()
     }
 
     /// Nothing hides the suggestions, though they may be for an older line.
     fn drawable(&self) -> bool {
-        self.can_show() && !self.items.is_empty() && self.dismissed.as_deref() != Some(self.line.as_str())
+        self.can_show()
+            && self.completion_requested()
+            && !self.items.is_empty()
+            && self.dismissed.as_deref() != Some(self.line.as_str())
     }
 
     // ------------------------------------------------------------ events
@@ -1450,11 +1458,11 @@ impl Session {
                 Some(added) if self.unconfirmed.starts_with(added) => self.unconfirmed[added.len()..].to_string(),
                 _ => String::new(),
             };
-            if std::mem::take(&mut self.close_after_insert) {
+            // The popup closes after a finished word, or for the shell's own history: like Esc,
+            // that ends a toggled popup (with `toggle_only`, typing doesn't bring it back).
+            if std::mem::take(&mut self.close_after_insert) || self.shell_nav {
                 self.dismissed = Some(line.clone());
-            }
-            if self.shell_nav {
-                self.dismissed = Some(line.clone());
+                self.manual = false;
             }
             // A cleared line (Ctrl+C) ends a toggled popup as running it does.
             if line.is_empty() {
@@ -1645,6 +1653,7 @@ impl Session {
         let (line, label, since) = self.loading.as_ref()?;
         let show = *line == self.line
             && since.elapsed() >= LOADING_DELAY
+            && self.completion_requested()
             && self.editing
             && !self.hidden
             && !self.visible()
@@ -1669,6 +1678,11 @@ impl Session {
     fn request(&mut self) {
         if self.history_mode {
             self.show_history();
+            return;
+        }
+        // With `toggle_only`, nothing runs (generators, registry searches) until the toggle.
+        if !self.completion_requested() {
+            self.loading = None;
             return;
         }
         let mut env = self.env.clone();
@@ -2002,6 +2016,7 @@ impl Session {
     /// Enter may be held back to act on up-to-date suggestions.
     fn enter_can_wait(&self) -> bool {
         self.can_show()
+            && self.completion_requested()
             && self.pending_enter.is_none()
             && self.bindings.action(&Key::ENTER) == Some(Action::Accept)
             && self.cfg.behavior.enter_accepts != "never"
@@ -2026,6 +2041,7 @@ impl Session {
     /// Enter waits briefly for this line's loading suggestions, to act on the final list.
     fn enter_should_wait(&self) -> bool {
         self.pending_enter.is_none()
+            && self.completion_requested()
             && self.bindings.action(&Key::ENTER) == Some(Action::Accept)
             && self.cfg.behavior.enter_accepts != "never"
             && !self.just_accepted
