@@ -3,7 +3,9 @@
 ran without error, issue #56), in zsh, bash, fish and nu,
 in a private tmux server. Run after cargo build --release: python3 tests/history_tmux.py."""
 import os
+import re
 import shutil
+import sys
 import subprocess
 import tempfile
 import time
@@ -28,7 +30,7 @@ PROMPTS = {
 
 @unittest.skipUnless(shutil.which('tmux'), 'tmux is required')
 class HistoryTmux(unittest.TestCase):
-    def start(self, kind, config=''):
+    def start(self, kind, config='', rc_extra='', custom_history=None, lig_history=None):
         shell = SHELLS[kind]
         if not shell:
             self.skipTest(f'{kind} is unavailable')
@@ -48,7 +50,15 @@ class HistoryTmux(unittest.TestCase):
         rc = {'zsh': home / '.zshrc', 'bash': home / '.bashrc', 'fish': home / '.config/fish/config.fish',
               'nu': home / '.config/nushell/config.nu'}[kind]
         rc.parent.mkdir(parents=True, exist_ok=True)
-        rc.write_text(PROMPTS[kind])
+        rc.write_text(PROMPTS[kind] + rc_extra)
+        if custom_history is not None:
+            (home / 'custom').mkdir()
+            (home / 'custom/history').write_text(custom_history)
+        if lig_history is not None:
+            # A history lig already has: the shells' files no longer seed it.
+            lig = home / 'Library/Application Support/lig' if sys.platform == 'darwin' else self.state / 'lig'
+            lig.mkdir(parents=True)
+            (lig / 'history').write_text(lig_history)
         if config:
             (home / '.config/lig').mkdir(parents=True, exist_ok=True)
             (home / '.config/lig/config.toml').write_text(config)
@@ -146,6 +156,45 @@ class HistoryTmux(unittest.TestCase):
                 self.wait('no full history', lambda s: 'echo in-fa' in entries() and 'echo in-fb' in entries())
                 self.assertNotIn('local', entries())
                 self.doCleanups()
+
+    def test_histfile_set_in_the_rc_file_is_added(self):
+        """HISTFILE set in .zshrc or .bashrc isn't exported: the hooks tell lig where it is."""
+        files = {'zsh': ': 1700000000:0;echo from-custom-histfile\n',
+                 'bash': '#1700000000\necho from-custom-histfile\n'}
+        for kind, text in files.items():
+            with self.subTest(kind):
+                self.start(kind, rc_extra='HISTFILE="$HOME/custom/history"\n', custom_history=text,
+                           lig_history='1700000100\techo recorded-by-lig\n')
+                self.run_line('echo hist-ok')
+                time.sleep(.5)
+                self.tmux('send-keys', '-t', 'test:0.0', 'C-r')
+                entries = lambda: ''.join(l for l in self.screen().splitlines() if '↺' in l)
+                self.wait('HISTFILE not added',
+                          lambda s: all(c in entries() for c in ['echo hist-ok', 'recorded-by-lig', 'from-custom-histfile']))
+                # bash's `#<time>` lines date the commands; they aren't commands.
+                self.assertNotIn('#1700000000', entries())
+                self.doCleanups()
+
+    def test_typed_letters_are_bold_inside_a_command_too(self):
+        """Issue #63: `cl` matches `hipotclear` inside, and shows bold there as in `clear`."""
+        self.start('bash', lig_history='1\thipotclear\n2\tanonclear\n3\tclear\n')
+        self.tmux('send-keys', '-t', 'test:0.0', 'C-r')
+        self.tmux('send-keys', '-t', 'test:0.0', '-l', 'cl')
+        self.wait('no matches', lambda s: 'hipotclear' in s and 'anonclear' in s)
+        sgr = r'(?:\x1b\[[0-9;]*m)*'
+        styled = self.tmux('capture-pane', '-p', '-e', '-t', 'test:0.0')
+        for before in ['hipot', 'anon']:
+            m = re.search(re.escape(before) + f'({sgr})c{sgr}l', styled)
+            self.assertTrue(m, f'{before}cl not found:\n{styled!r}')
+            self.assertRegex(m.group(1), r'\x1b\[(?:[0-9;]*;)?1[;m]', f'{before}: cl not bold')
+
+    def test_max_width_shows_a_long_command_whole(self):
+        """Issue #65: with `width = "auto"`, `max_width` let only 44 columns of a command show."""
+        long = 'docker compose -f docker-compose.prod.yml up -d --build --remove-orphans web'
+        self.start('bash', '[ui]\nwidth = "auto"\nmax_width = 888\n', lig_history=f'1700000000\t{long}\n')
+        self.tmux('send-keys', '-t', 'test:0.0', 'C-r')
+        self.wait('no history popup', lambda s: 'docker compose' in s)
+        self.wait('command cut', lambda s: long in s)
 
     def test_off_leaves_ctrl_r_to_the_shell(self):
         self.start('bash', '[behavior]\nhistory = false\n')

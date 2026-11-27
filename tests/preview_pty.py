@@ -962,7 +962,9 @@ adaptive_size = false
 
     def test_floating_text_zoom_resets_when_switching_candidates(self):
         (self.home / 'pick-b.txt').write_text('B' * 42 + 'WIDE_MARKER\n' + '\n'.join(MARKS) + '\n')
-        self.start_popup("""[ui]
+        self.start_popup("""[behavior]
+wrap_around = true
+[ui]
 width = 70
 [preview]
 enabled = true
@@ -984,7 +986,7 @@ max_height = 18
         self.wait(lambda s: self.frame(s, short) is None and 'pick-a.txt' in s)
         self.tmux('send-keys', '-t', 'test:0.0', 'M-p')
         framed(short, (18, 80), 'MUST_RESTORE_A')
-        self.tmux('send-keys', '-t', 'test:0.0', 'Tab')
+        self.tmux('send-keys', '-t', 'test:0.0', 'Up')
         compact = framed(long, (8, 32), 'ROW_01')
         self.assertNotIn('WIDE_MARKER', compact)
         self.assertNotIn('ROW_10', compact)

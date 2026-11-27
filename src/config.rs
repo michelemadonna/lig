@@ -239,6 +239,9 @@ pub struct Behavior {
     pub complete_commands: bool,
     /// Show completion suggestions only after the toggle key is pressed.
     pub toggle_only: bool,
+    /// Up (`keys.prev`) on the first suggestion selects the last one, as Down on the last one
+    /// selects the first, instead of closing the popup (so the next Up goes to shell history).
+    pub wrap_around: bool,
     /// Search package registries while you type (npm, crates.io, Docker Hub,
     /// PyPI versions, Snap Store, Flathub). What you type for the package name is sent
     /// to them.
@@ -336,6 +339,7 @@ impl Default for Behavior {
             show_on_empty_token: true,
             complete_commands: false,
             toggle_only: false,
+            wrap_around: false,
             online: true,
             history: true,
             history_success_only: false,
@@ -391,6 +395,13 @@ mod parse_tests {
         assert!(!Config::default().behavior.toggle_only);
         assert!(toml::to_string_pretty(&Config::default()).unwrap().contains("toggle_only = false"));
         assert!(Config::parse("[behavior]\ntoggle_only = true\n").unwrap().behavior.toggle_only);
+    }
+
+    #[test]
+    fn wrap_around_is_opt_in() {
+        assert!(!Config::default().behavior.wrap_around);
+        assert!(toml::to_string_pretty(&Config::default()).unwrap().contains("wrap_around = false"));
+        assert!(Config::parse("[behavior]\nwrap_around = true\n").unwrap().behavior.wrap_around);
     }
 }
 

@@ -732,7 +732,7 @@ impl Session {
             size: screen.size(),
             completion: original.rect,
             known_from,
-            prompt: preview.prompt(screen, self.prompt_top, self.prompt_end.as_ref().map(|p| p.row)),
+            prompt: preview.prompt(screen, self.screen_tracking.prompt_top, self.prompt_end.as_ref().map(|p| p.row)),
         };
         let cursor = screen.cursor_position();
         let prompt = context.prompt.clone();
@@ -756,7 +756,7 @@ impl Session {
             // preview, also keep the list clear of a multiline prompt or buffer tail.
             let Some(safe) = layout_list(&self.cfg.ui) else {
                 preview.cancel();
-                if self.prompt_top.is_some() {
+                if self.screen_tracking.prompt_top.is_some() {
                     *list = None;
                 }
                 return;

@@ -169,6 +169,34 @@ pub fn printable(s: &str) -> String {
 }
 
 /// Truncate to `w` columns (adding `…` when cut) and pad to exactly `w`.
+/// Which of `label`'s characters `query` matched, ignoring case: its start, else where it
+/// is inside, else (fuzzy) each typed character in order.
+fn matched(label: &str, query: &str) -> Vec<bool> {
+    let label: Vec<char> = label.chars().collect();
+    let query: Vec<char> = query.chars().collect();
+    let mut marked = vec![false; label.len()];
+    if query.is_empty() {
+        return marked;
+    }
+    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    let at = |i: usize| label[i..].len() >= query.len() && label[i..].iter().zip(&query).all(|(&a, &b)| same(a, b));
+    if let Some(start) = (0..label.len()).find(|&i| at(i)) {
+        marked[start..start + query.len()].fill(true);
+        return marked;
+    }
+    let mut from = 0;
+    for &q in query.iter().filter(|c| !c.is_whitespace()) {
+        match (from..label.len()).find(|&i| same(label[i], q)) {
+            Some(i) => {
+                marked[i] = true;
+                from = i + 1;
+            }
+            None => return vec![false; label.len()],
+        }
+    }
+    marked
+}
+
 fn fit(s: &str, w: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -197,6 +225,9 @@ const MIN_BELOW: u16 = 4;
 const BOTTOM_DESC_W: u16 = 56;
 /// A description column narrower than this isn't worth showing.
 const MIN_DESC: u16 = 8;
+/// The widest a suggestion's name makes the popup, keeping it compact; a history command
+/// (`Ctrl+R`) is read whole, so only `max_width` limits it.
+const NAME_FIT: usize = 44;
 
 /// Where the popup goes for this screen/cursor, or `None` if it can't fit.
 pub fn layout(ui: &Ui, items: &[Suggestion], size: (u16, u16), cursor: (u16, u16), token_width: u16) -> Option<Layout> {
@@ -233,7 +264,12 @@ pub fn layout_at(
         return None;
     }
     // Capped before the cast to u16: a longer one would wrap around.
-    let name_need = items.iter().map(|s| s.label.width()).max().unwrap_or(1).clamp(4, 44) as u16;
+    let longest_name = items.iter().map(|s| s.label.width()).max().unwrap_or(1).min(usize::from(cols)) as u16;
+    let fit = |s: &Suggestion| match s.icon {
+        Some(crate::spec::Icon::History) => s.label.width(),
+        _ => s.label.width().min(NAME_FIT),
+    };
+    let name_need = items.iter().map(fit).max().unwrap_or(1).clamp(4, usize::from(cols)) as u16;
     let bottom = ui.descriptions && ui.description_position == "bottom";
     let longest_desc = items.iter().map(|s| s.description.width()).max().unwrap_or(0).min(usize::from(cols)) as u16;
     let desc_need = if ui.descriptions && !bottom { longest_desc.min(style.desc_max) } else { 0 };
@@ -252,12 +288,18 @@ pub fn layout_at(
     .clamp(smallest, cols);
     // The name gets space first; the description is dropped when it wouldn't be readable.
     let inner = width - chrome_w;
-    let mut name_w = name_need.min(inner);
+    let mut name_w = inner;
     let mut desc_w = 0;
-    if desc_need > 0 && inner >= name_w + style.gap + MIN_DESC.min(desc_need) {
+    // A long history command doesn't push out its time while it still gets a compact name's room.
+    let least_name = name_need.min(NAME_FIT as u16).min(inner);
+    let desc_room = inner.saturating_sub(least_name + style.gap);
+    if desc_need > 0 && desc_room >= MIN_DESC.min(desc_need) {
+        name_w = name_need.min(inner - style.gap - desc_need.min(desc_room));
+        // Room beyond what the description needs goes to a cut name first (a wide `width`
+        // shows more of a long command, not more blank after its time), then back to it.
+        let room = inner - name_w - style.gap;
+        name_w += (room - desc_need.min(room)).min(longest_name.saturating_sub(name_w));
         desc_w = inner - name_w - style.gap;
-    } else {
-        name_w = inner;
     }
 
     // A percent height includes the border; a row count doesn't.
@@ -352,19 +394,21 @@ pub fn render(ui: &Ui, l: &Layout, items: &[Suggestion], selected: usize, scroll
                 if s.kind == Kind::Info {
                     line.push_str(&format!("\x1b[3;{}m{label}\x1b[23;{fg}m", t.info_fg));
                 } else {
-                    // The typed prefix, highlighted.
-                    let hl = if !s.query.is_empty() && s.label.to_lowercase().starts_with(&s.query.to_lowercase()) {
-                        s.query.chars().count().min(label.chars().count())
-                    } else {
-                        0
-                    };
-                    let split = label.char_indices().nth(hl).map_or(label.len(), |(b, _)| b);
-                    let (a, b) = label.split_at(split);
-                    if hl > 0 {
-                        let mfg = if sel { fg } else { &t.match_fg };
-                        line.push_str(&format!("\x1b[1;{mfg}m{a}\x1b[22;{fg}m{b}"));
-                    } else {
-                        line.push_str(&label);
+                    // What was typed, highlighted where it matched; not the `…` of a cut label.
+                    let marked = matched(&s.label, &s.query);
+                    let original: Vec<char> = s.label.chars().collect();
+                    let mfg = if sel { fg } else { &t.match_fg };
+                    let mut on = false;
+                    for (i, c) in label.chars().enumerate() {
+                        let hl = marked.get(i) == Some(&true) && original.get(i) == Some(&c);
+                        if hl != on {
+                            on = hl;
+                            line.push_str(&if on { format!("\x1b[1;{mfg}m") } else { format!("\x1b[22;{fg}m") });
+                        }
+                        line.push(c);
+                    }
+                    if on {
+                        line.push_str(&format!("\x1b[22;{fg}m"));
                     }
                 }
                 if l.desc_w > 0 {
@@ -516,6 +560,60 @@ pub fn restore_cursor(out: &mut Vec<u8>, screen: &vt100::Screen) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn history_commands_get_the_width_settings_allow() {
+        use crate::config::Size;
+        let long = "docker compose -f docker-compose.prod.yml up -d --build --remove-orphans web worker";
+        let one = |label: &str, history: bool| {
+            vec![Suggestion {
+                label: label.into(),
+                description: "2h ago".into(),
+                kind: Kind::Command,
+                icon: history.then_some(crate::spec::Icon::History),
+                insert: String::new(),
+                delete: 0,
+                back: 0,
+                query: String::new(),
+            }]
+        };
+        let at = |ui: &Ui, it: &[Suggestion]| layout(ui, it, (40, 200), (2, 10), 0).unwrap();
+        let (history, completion) = (one(long, true), one(long, false));
+        // Issue #65: `max_width` lets a long command show whole.
+        let ui = Ui { max_width: Size::Cells(888), ..Ui::default() };
+        assert_eq!(at(&ui, &history).name_w as usize, long.len());
+        // A completion keeps its compact name.
+        assert_eq!(at(&ui, &completion).name_w as usize, NAME_FIT);
+        // The default `max_width` (100) still bounds a command.
+        let l = at(&Ui::default(), &history);
+        assert_eq!(l.rect.width, 100);
+        assert_eq!((l.rect.width, l.desc_w), (100, 6));
+        assert!(l.name_w as usize > NAME_FIT && (l.name_w as usize) < long.len());
+        // A fixed width shows more of a long name, not more blank after the time.
+        let wide = Ui { width: Size::Cells(120), ..Ui::default() };
+        for it in [&history, &completion] {
+            let l = at(&wide, it);
+            assert_eq!((l.rect.width, l.name_w as usize), (120, long.len()));
+            assert!(l.desc_w >= 6);
+        }
+        // A short name leaves the rest to the description, as before.
+        assert_eq!(at(&wide, &one("git status", false)).name_w, 10);
+    }
+
+    #[test]
+    fn matches_are_marked_at_the_start_inside_or_in_order() {
+        let marks = |label, query| -> String {
+            matched(label, query).iter().map(|&m| if m { '^' } else { ' ' }).collect::<String>().trim_end().into()
+        };
+        assert_eq!(marks("clear", "cl"), "^^");
+        assert_eq!(marks("hipotclear", "cl"), "     ^^");
+        assert_eq!(marks("anonclear", "CL"), "    ^^");
+        assert_eq!(marks("git checkout", "gco"), "^   ^    ^");
+        assert_eq!(marks("git checkout", "g co"), "^   ^    ^");
+        assert_eq!(marks("ls", "lx"), "");
+        assert_eq!(marks("ls", ""), "");
+        assert_eq!(marks("café", "FÉ"), "  ^^");
+    }
+
     fn items(n: usize) -> Vec<Suggestion> {
         (0..n)
             .map(|i| Suggestion {
@@ -652,6 +750,29 @@ mod tests {
         assert_eq!(printable("echo \x1b[31mred\x1b[0m"), "echo ␛[31mred␛[0m");
         assert_eq!(printable("a\tb\nc\x7f\u{85}"), "a b c␡�");
         assert_eq!(printable("plain ⏎ text"), "plain ⏎ text");
+    }
+
+    #[test]
+    fn matched_letters_are_bold_also_inside_a_label() {
+        let mut it = items(2);
+        for (s, label) in it.iter_mut().zip(["clear", "hipotclear"]) {
+            s.label = label.into();
+            s.query = "cl".into();
+        }
+        let ui = Ui { icons: "none".into(), ..Ui::default() };
+        let l = layout(&ui, &it, (24, 100), (2, 10), 0).unwrap();
+        let lines = render(&ui, &l, &it, 0, 0);
+        // The text between each bold on and off.
+        let bold = |line: &str| -> Vec<String> {
+            line.split("\x1b[1;")
+                .skip(1)
+                .map(|s| s.split_once('m').unwrap().1.split("\x1b[22;").next().unwrap().to_string())
+                .collect()
+        };
+        let row = |label: &str| lines.iter().find(|l| strip(l).trim_matches(['│', ' ']).starts_with(label)).unwrap();
+        assert_eq!(bold(row("clear")), ["cl"]);
+        assert_eq!(bold(row("hipotclear")), ["cl"]);
+        assert!(row("hipotclear").contains("hipot\x1b[1;"));
     }
 
     #[test]

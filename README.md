@@ -221,7 +221,7 @@ Type as usual; the popup shows what fits.
 | Key | Action |
 | --- | --- |
 | `Tab` / `↓` | next suggestion |
-| `Shift-Tab` / `↑` | previous suggestion (on the first one: close the popup) |
+| `Shift-Tab` / `↑` | previous suggestion (on the first one: close the popup, or go to the last with `wrap_around`) |
 | `Enter` | accept the suggestion |
 | `Shift+Enter` | accept the suggestion and run the line |
 | `Esc` | close the popup |
@@ -250,7 +250,8 @@ Type as usual; the popup shows what fits.
 - **History** (`Ctrl+R`) lists the commands you ran, in every Lig session, newest first
   and each once; typing narrows it (fuzzy), and `Enter` puts one on the line. `Alt+R` lists
   only those you ran in the current folder, marked `local` (and `Ctrl+R` switches back). It
-  starts with what zsh, bash, fish and nu remember; in `lig ssh` and `lig mosh` it's the
+  starts with what zsh, bash, fish and nu remember (zsh's and bash's `HISTFILE` too, wherever
+  it points); in `lig ssh` and `lig mosh` it's the
   server's history instead. A command typed with a leading space isn't kept;
   `history_success_only = true` keeps only those that ran without error, and
   `history = false` keeps nothing and leaves `Ctrl+R` to the shell.
@@ -284,6 +285,7 @@ enter_accepts = "auto"     # "always", "after-space", "never"
 enter_runs_commands = []   # Enter picks and runs in one press, e.g. ["z", "zi"]
 complete_commands = false  # pop up for command names too
 toggle_only = false        # true: open completions only with keys.toggle
+wrap_around = false        # true: Up on the first suggestion goes to the last, not closing
 options_after_dash = ["ls", "cp", "mv", "rm"]  # options only after -; "*" for all
 show_hidden_files = false  # list dot files without typing a dot first
 hide_variable_values = []  # also mask these $VARS' values: ["GH_*", "*_URL"], "*" for all
@@ -438,6 +440,7 @@ the scenes in zsh in a private tmux server, with `lig ssh` logging in to a throw
 
 Thanks to the contributors:
 
+- [@AdrielVelazquez](https://github.com/AdrielVelazquez)
 - [@albertomalossi](https://github.com/albertomalossi)
 - [@ammachado](https://github.com/ammachado)
 - [@aslan403](https://github.com/aslan403)
@@ -452,6 +455,7 @@ Thanks to the contributors:
 - [@nadelacruz-00](https://github.com/nadelacruz-00)
 - [@oldmanniko-dev](https://github.com/oldmanniko-dev)
 - [@romainharlaut](https://github.com/romainharlaut)
+- [@rrittste](https://github.com/rrittste)
 - [@techwizrd](https://github.com/techwizrd)
 - [@thomasaarholt](https://github.com/thomasaarholt)
 - [@vishudhshah](https://github.com/vishudhshah)
